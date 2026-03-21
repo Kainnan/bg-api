@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
+import time
 from enum import Enum
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 from scipy import ndimage
+
+logger = logging.getLogger("bg_api.image_service")
 
 # WebP: compressão agressiva mas estável para assets com alpha (method=6 = melhor ratio, mais lento).
 # Ajuste via ambiente sem alterar código: OUTPUT_WEBP_QUALITY, OUTPUT_WEBP_METHOD, OUTPUT_WEBP_ALPHA_QUALITY.
@@ -108,11 +112,19 @@ def compress_to_webp_only(input_path: str, *, output_path: str) -> str:
 try:
     from rembg import new_session, remove as rembg_remove
 
+    logger.info("Carregando sessão rembg (birefnet-general)… pode demorar no 1º boot enquanto baixa o modelo (~300 MB)")
+    _t = time.perf_counter()
     # birefnet-general: melhor modelo geral para assets ilustrados, logos e
     # objetos com fundo sólido/gradiente. Não requer GPU mas usa se disponível.
     _SESSION = new_session("birefnet-general")
     _REMBG_AVAILABLE = True
+    logger.info("Sessão rembg pronta (%.1fs)", time.perf_counter() - _t)
 except ImportError:
+    logger.warning("rembg não instalado — usando fallback por threshold")
+    _REMBG_AVAILABLE = False
+    _SESSION = None
+except Exception as _e:
+    logger.error("Falha ao inicializar rembg: %s — usando fallback por threshold", _e)
     _REMBG_AVAILABLE = False
     _SESSION = None
 
@@ -139,15 +151,23 @@ def _is_light_background_pixel(
 
 
 def _remove_by_threshold(image: Image.Image, threshold: int) -> Image.Image:
-    """Remove fundo claro pixel a pixel (método legado)."""
+    """Remove fundo claro pixel a pixel (método legado / fallback)."""
+    logger.warning(
+        "_remove_by_threshold: usando fallback por threshold=%d (rembg indisponível). "
+        "ATENÇÃO: O(W×H) em Python puro — lento para imagens grandes.",
+        threshold,
+    )
     img = image.convert("RGBA")
     pixels = img.load()
     width, height = img.size
+    logger.debug("_remove_by_threshold: imagem %dx%d (%d pixels)", width, height, width * height)
+    t0 = time.perf_counter()
     for y in range(height):
         for x in range(width):
             r, g, b, a = pixels[x, y]
             if _is_light_background_pixel(r, g, b, threshold=threshold):
                 pixels[x, y] = (255, 255, 255, 0)
+    logger.info("_remove_by_threshold: concluído em %.2fs", time.perf_counter() - t0)
     return img
 
 
@@ -414,12 +434,25 @@ def remove_background(
     threshold: int | None = None,
 ) -> str:
     input_file = Path(input_path)
+    thr = int(threshold if threshold is not None else 245)
+
+    logger.debug("remove_background: %s (threshold=%d, rembg=%s)", input_file.name, thr, _REMBG_AVAILABLE)
+    t0 = time.perf_counter()
+
     image = Image.open(input_file)
+    logger.debug("remove_background: imagem aberta %dx%d modo=%s", image.width, image.height, image.mode)
 
     if _REMBG_AVAILABLE:
-        result: Image.Image = rembg_remove(image, session=_SESSION)
+        logger.debug("remove_background: chamando rembg…")
+        try:
+            result: Image.Image = rembg_remove(image, session=_SESSION)
+        except Exception as exc:
+            logger.error(
+                "remove_background: rembg falhou (%s) — aplicando fallback por threshold=%d",
+                exc, thr,
+            )
+            result = _remove_by_threshold(image, thr)
     else:
-        thr = threshold if threshold is not None else 245
         result = _remove_by_threshold(image, thr)
 
     result = result.convert("RGBA")
@@ -429,16 +462,23 @@ def remove_background(
     arr = np.array(result)
     alpha = arr[:, :, 3]
     if not _is_frame_asset(input_path):
+        logger.debug("remove_background: aplicando fill_holes no alpha")
         arr[:, :, 3] = ndimage.binary_fill_holes(alpha > 128).astype(np.uint8) * 255
     else:
-        thr = int(threshold if threshold is not None else 245)
         kind = _detect_frame_kind(input_path)
+        logger.info("remove_background: frame detectado — tipo=%s arquivo=%s", kind.value, input_file.name)
         arr = _cleanup_frame_interior_by_kind(arr, kind, thr)
 
     result = Image.fromarray(arr, "RGBA")
 
     final_output = Path(output_path)
     save_rgba_as_webp(result, final_output)
+
+    out_size = final_output.stat().st_size
+    logger.debug(
+        "remove_background: salvo em %.2fs → %s (%.1f KB)",
+        time.perf_counter() - t0, final_output.name, out_size / 1024,
+    )
     return str(final_output.resolve())
 
 

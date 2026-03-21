@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import io
+import logging
 import re
 import shutil
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -14,6 +16,8 @@ from app.services.image_service import (
     is_background_asset,
     remove_light_background,
 )
+
+logger = logging.getLogger("bg_api.zip_service")
 
 ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 
@@ -64,14 +68,19 @@ def _extract_zip_archive(zf: zipfile.ZipFile, target_root: Path) -> None:
 
 def extract_zip_bytes_to_dir(zip_bytes: bytes, dest_dir: Path) -> None:
     """Extrai bytes de um ZIP para `dest_dir` (sem gravar o .zip em disco)."""
+    logger.debug("extract_zip_bytes_to_dir: extraindo %.1f KB → %s", len(zip_bytes) / 1024, dest_dir)
     try:
         with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
+            members = zf.infolist()
+            logger.debug("extract_zip_bytes_to_dir: %d membros no ZIP", len(members))
             _extract_zip_archive(zf, dest_dir)
     except HTTPException:
         raise
-    except zipfile.BadZipFile:
+    except zipfile.BadZipFile as exc:
+        logger.error("extract_zip_bytes_to_dir: arquivo ZIP inválido — %s", exc)
         raise HTTPException(status_code=400, detail="arquivo zip inválido")
-    except Exception:
+    except Exception as exc:
+        logger.error("extract_zip_bytes_to_dir: erro inesperado — %s", exc, exc_info=True)
         raise HTTPException(status_code=400, detail="não foi possível processar o zip")
 
 
@@ -152,6 +161,8 @@ def _mapped_output_name(original_path: Path, used_names: set[str]) -> str:
 
 def process_zip_bytes_to_output_zip_bytes(zip_bytes: bytes, *, threshold: int = 245) -> bytes:
     """Processa um ZIP em diretório temporário e retorna o ZIP final em memória."""
+    t_total = time.perf_counter()
+
     with tempfile.TemporaryDirectory(prefix="bgapi_") as tmp:
         root = Path(tmp)
         input_dir = root / "in"
@@ -162,15 +173,45 @@ def process_zip_bytes_to_output_zip_bytes(zip_bytes: bytes, *, threshold: int = 
         extract_zip_bytes_to_dir(zip_bytes, input_dir)
         images = list_images_in_folder(input_dir)
 
+        if not images:
+            logger.warning("process_zip: nenhuma imagem encontrada no ZIP")
+            raise HTTPException(status_code=400, detail="nenhuma imagem encontrada no zip")
+
+        logger.info("process_zip: %d imagens encontradas, iniciando processamento (threshold=%d)", len(images), threshold)
+
         used_names: set[str] = set()
-        for src in images:
+        ok_count = 0
+        err_count = 0
+
+        for i, src in enumerate(images, 1):
             out_name = _mapped_output_name(src, used_names)
             out_path = output_dir / out_name
+            is_bg = is_background_asset(str(src))
+            mode = "background" if is_bg else "rembg"
+            logger.info("[%d/%d] %s → %s (%s)", i, len(images), src.name, out_name, mode)
 
-            if is_background_asset(str(src)):
-                compress_to_webp_only(str(src), output_path=str(out_path))
-            else:
-                remove_light_background(str(src), threshold=threshold, output_path=str(out_path))
+            t_img = time.perf_counter()
+            try:
+                if is_bg:
+                    compress_to_webp_only(str(src), output_path=str(out_path))
+                else:
+                    remove_light_background(str(src), threshold=threshold, output_path=str(out_path))
+                elapsed_img = time.perf_counter() - t_img
+                out_kb = out_path.stat().st_size / 1024
+                logger.info("[%d/%d] ✓ %s → %.1f KB (%.2fs)", i, len(images), out_name, out_kb, elapsed_img)
+                ok_count += 1
+            except Exception as exc:
+                logger.error("[%d/%d] ✗ erro em %s: %s", i, len(images), src.name, exc, exc_info=True)
+                err_count += 1
+
+        logger.info(
+            "process_zip: processamento concluído — %d ok, %d erros (%.2fs total)",
+            ok_count, err_count, time.perf_counter() - t_total,
+        )
+
+        if ok_count == 0:
+            logger.error("process_zip: todas as imagens falharam")
+            raise HTTPException(status_code=500, detail="falha ao processar todas as imagens")
 
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -178,4 +219,6 @@ def process_zip_bytes_to_output_zip_bytes(zip_bytes: bytes, *, threshold: int = 
                 if file_path.is_file():
                     zf.write(file_path, arcname=file_path.name)
         zip_buffer.seek(0)
-        return zip_buffer.read()
+        result = zip_buffer.read()
+        logger.info("process_zip: ZIP de saída gerado (%.1f KB)", len(result) / 1024)
+        return result
