@@ -549,6 +549,27 @@ def _cleanup_frame_interior_by_kind(
         logger.debug("_cleanup_frame: bg_mask cobre %d px (%.1f%%)", bg_mask.sum(), 100 * bg_mask.mean())
         arr[bg_mask, :] = 0  # força RGBA=0 em todo pixel que era fundo no original
 
+        # Passagem 3: limpeza complementar por cor nas regiões de inset
+        # Pixels "órfãos" que ficaram desconectados do seed por anti-aliasing
+        # dos divisores não são pegos pelo connected components. Uma varredura
+        # por cor no original dentro das regiões de inset (mais conservadoras)
+        # limpa esses resíduos sem risco de comer arte do frame.
+        thr = threshold - 10
+        for x0, y0, x1, y1 in regions:
+            x0c = max(0, min(w, x0))
+            x1c = max(0, min(w, x1))
+            y0c = max(0, min(h, y0))
+            y1c = max(0, min(h, y1))
+            if x0c >= x1c or y0c >= y1c:
+                continue
+            orig_sl = original_arr[y0c:y1c, x0c:x1c, :3].astype(np.int16)
+            was_white = (
+                (orig_sl[:, :, 0] >= thr)
+                & (orig_sl[:, :, 1] >= thr)
+                & (orig_sl[:, :, 2] >= thr)
+            )
+            arr[y0c:y1c, x0c:x1c][was_white] = 0
+
     return arr
 
 
