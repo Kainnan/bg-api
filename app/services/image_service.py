@@ -453,10 +453,43 @@ def _cell_deep_centers(h: int, w: int, kind: FrameKind) -> list[tuple[int, int, 
     return [(x0b + ix, y0b + iy, x1b - ix, y1b - iy)]
 
 
+def _clear_original_white_in_regions(
+    arr: np.ndarray,
+    original_arr: np.ndarray,
+    regions: list[tuple[int, int, int, int]],
+    threshold: int,
+) -> None:
+    """
+    Para cada região de célula, zera pixels que eram quase-brancos na imagem ORIGINAL.
+
+    O rembg às vezes mantém pixels de fundo branco com alpha > 0 nas células.
+    Como o fundo original é branco e os elementos do frame são coloridos (ouro, azul),
+    qualquer pixel original com R,G,B >= threshold-10 dentro das células é fundo —
+    pode ser zerado com segurança sem afetar a arte do frame.
+    """
+    thr = threshold - 10
+    h, w = arr.shape[:2]
+    for x0, y0, x1, y1 in regions:
+        x0 = max(0, min(w, x0))
+        x1 = max(0, min(w, x1))
+        y0 = max(0, min(h, y0))
+        y1 = max(0, min(h, y1))
+        if x0 >= x1 or y0 >= y1:
+            continue
+        orig_sl = original_arr[y0:y1, x0:x1]
+        r = orig_sl[:, :, 0].astype(np.int16)
+        g = orig_sl[:, :, 1].astype(np.int16)
+        b = orig_sl[:, :, 2].astype(np.int16)
+        # Pixels que eram brancos/quase-brancos no original → fundo garantido
+        was_white = (r >= thr) & (g >= thr) & (b >= thr)
+        arr[y0:y1, x0:x1][was_white] = [0, 0, 0, 0]
+
+
 def _cleanup_frame_interior_by_kind(
     arr: np.ndarray,
     kind: FrameKind,
     threshold: int,
+    original_arr: np.ndarray | None = None,
 ) -> np.ndarray:
     """Aplica limpeza de fundo claro só nas regiões internas esperadas para cada tipo."""
     h, w = arr.shape[:2]
@@ -467,19 +500,15 @@ def _cleanup_frame_interior_by_kind(
     else:
         regions = _frame_regions_moldura(h, w)
 
-    # Passagem 1: limpeza por cor nas regiões com inset conservador
+    # Passagem 1: limpeza por cor (rembg output) — conservadora, protege bordas
     for x0, y0, x1, y1 in regions:
         _clear_light_in_rect(arr, x0, y0, x1, y1, threshold, frame_interior=True)
 
-    # Passagem 2: limpeza incondicional do centro profundo de cada célula
-    # (inset de 20% — longe de qualquer divisor ou elemento decorativo do frame)
-    for x0, y0, x1, y1 in _cell_deep_centers(h, w, kind):
-        x0 = max(0, min(w, x0))
-        x1 = max(0, min(w, x1))
-        y0 = max(0, min(h, y0))
-        y1 = max(0, min(h, y1))
-        if x0 < x1 and y0 < y1:
-            arr[y0:y1, x0:x1] = [0, 0, 0, 0]
+    # Passagem 2: limpeza baseada na imagem ORIGINAL
+    # Pixels que eram brancos no original mas o rembg manteve → claramente fundo
+    # Arte do frame (ouro, azul) não é branca → não é afetada
+    if original_arr is not None:
+        _clear_original_white_in_regions(arr, original_arr, regions, threshold)
 
     return arr
 
@@ -498,6 +527,10 @@ def remove_background(
 
     image = Image.open(input_file)
     logger.debug("remove_background: imagem aberta %dx%d modo=%s", image.width, image.height, image.mode)
+
+    is_frame = _is_frame_asset(input_path)
+    # Captura o array original antes do rembg para uso no cleanup de frames
+    original_arr = np.array(image.convert("RGBA")) if is_frame else None
 
     if _REMBG_AVAILABLE:
         logger.debug("remove_background: chamando rembg…")
@@ -518,13 +551,13 @@ def remove_background(
     # Tipos: grid 3×3, 3 reels (faixas), moldura única — limpeza direcionada no interior.
     arr = np.array(result)
     alpha = arr[:, :, 3]
-    if not _is_frame_asset(input_path):
+    if not is_frame:
         logger.debug("remove_background: aplicando fill_holes no alpha")
         arr[:, :, 3] = ndimage.binary_fill_holes(alpha > 128).astype(np.uint8) * 255
     else:
         kind = _detect_frame_kind(input_path)
         logger.info("remove_background: frame detectado — tipo=%s arquivo=%s", kind.value, input_file.name)
-        arr = _cleanup_frame_interior_by_kind(arr, kind, thr)
+        arr = _cleanup_frame_interior_by_kind(arr, kind, thr, original_arr=original_arr)
 
     result = Image.fromarray(arr, "RGBA")
 
