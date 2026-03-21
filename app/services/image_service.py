@@ -118,7 +118,11 @@ try:
     # objetos com fundo sólido/gradiente. Não requer GPU mas usa se disponível.
     _SESSION = new_session("birefnet-general")
     _REMBG_AVAILABLE = True
-    logger.info("Sessão rembg pronta (%.1fs)", time.perf_counter() - _t)
+    import onnxruntime as _ort
+    _providers = _ort.get_available_providers()
+    logger.info("Sessão rembg pronta (%.1fs) | ONNX providers: %s", time.perf_counter() - _t, _providers)
+    if "CUDAExecutionProvider" not in _providers:
+        logger.warning("⚠ GPU NÃO está sendo usada! Instale onnxruntime-gpu e verifique o CUDA.")
 except ImportError:
     logger.warning("rembg não instalado — usando fallback por threshold")
     _REMBG_AVAILABLE = False
