@@ -453,36 +453,72 @@ def _cell_deep_centers(h: int, w: int, kind: FrameKind) -> list[tuple[int, int, 
     return [(x0b + ix, y0b + iy, x1b - ix, y1b - iy)]
 
 
-def _clear_original_white_in_regions(
-    arr: np.ndarray,
-    original_arr: np.ndarray,
-    regions: list[tuple[int, int, int, int]],
-    threshold: int,
-) -> None:
-    """
-    Para cada região de célula, zera pixels que eram quase-brancos na imagem ORIGINAL.
+def _cell_center_seeds(h: int, w: int, kind: FrameKind) -> list[tuple[int, int]]:
+    """Retorna coordenadas (y, x) aproximadas dos centros de cada célula para seeding."""
+    margin = float(os.getenv("FRAME_MARGIN_FRAC", "0.07"))
+    y0b, y1b, x0b, x1b = _usable_inner_bounds(h, w, margin)
+    uw, uh = x1b - x0b, y1b - y0b
+    if kind is FrameKind.GRID_9:
+        cw, ch = max(1, uw // 3), max(1, uh // 3)
+        return [
+            (y0b + gy * ch + ch // 2, x0b + gx * cw + cw // 2)
+            for gy in range(3) for gx in range(3)
+        ]
+    if kind is FrameKind.REELS_3:
+        sw = max(1, uw // 3)
+        return [(y0b + uh // 2, x0b + gx * sw + sw // 2) for gx in range(3)]
+    # MOLDURA
+    return [(y0b + uh // 2, x0b + uw // 2)]
 
-    O rembg às vezes mantém pixels de fundo branco com alpha > 0 nas células.
-    Como o fundo original é branco e os elementos do frame são coloridos (ouro, azul),
-    qualquer pixel original com R,G,B >= threshold-10 dentro das células é fundo —
-    pode ser zerado com segurança sem afetar a arte do frame.
+
+def _connected_background_mask(
+    original_arr: np.ndarray,
+    h: int,
+    w: int,
+    cell_seeds_yx: list[tuple[int, int]],
+    threshold: int,
+) -> np.ndarray:
+    """
+    Detecta pixels de fundo usando componentes conectados no original.
+
+    1. Marca pixels "claros" no original (R,G,B >= threshold-10) como candidatos
+    2. Faz labeling de componentes conectados (4-conectividade)
+    3. Seleciona componentes que tocam a borda da imagem (fundo externo)
+       OU contêm os centros das células (fundo interno das células)
+    4. Retorna máscara booleana de fundo
+
+    Vantagem sobre inset: para naturalmente nos divisores coloridos do frame,
+    sem precisar definir zonas de exclusão manualmente.
     """
     thr = threshold - 10
-    h, w = arr.shape[:2]
-    for x0, y0, x1, y1 in regions:
-        x0 = max(0, min(w, x0))
-        x1 = max(0, min(w, x1))
-        y0 = max(0, min(h, y0))
-        y1 = max(0, min(h, y1))
-        if x0 >= x1 or y0 >= y1:
-            continue
-        orig_sl = original_arr[y0:y1, x0:x1]
-        r = orig_sl[:, :, 0].astype(np.int16)
-        g = orig_sl[:, :, 1].astype(np.int16)
-        b = orig_sl[:, :, 2].astype(np.int16)
-        # Pixels que eram brancos/quase-brancos no original → fundo garantido
-        was_white = (r >= thr) & (g >= thr) & (b >= thr)
-        arr[y0:y1, x0:x1][was_white] = [0, 0, 0, 0]
+    rgb = original_arr[:, :, :3].astype(np.int16)
+    is_light = (rgb[:, :, 0] >= thr) & (rgb[:, :, 1] >= thr) & (rgb[:, :, 2] >= thr)
+
+    labeled, _ = ndimage.label(is_light)
+
+    bg_labels: set[int] = set()
+
+    # Componentes que tocam as bordas da imagem = fundo externo
+    border_labels = (
+        set(labeled[0, :].tolist())
+        | set(labeled[-1, :].tolist())
+        | set(labeled[:, 0].tolist())
+        | set(labeled[:, -1].tolist())
+    )
+    border_labels.discard(0)
+    bg_labels.update(border_labels)
+
+    # Componentes que contêm os centros das células = fundo interno
+    for cy, cx in cell_seeds_yx:
+        if 0 <= cy < h and 0 <= cx < w:
+            label = int(labeled[cy, cx])
+            if label > 0:
+                bg_labels.add(label)
+
+    if not bg_labels:
+        return np.zeros((h, w), dtype=bool)
+
+    return np.isin(labeled, list(bg_labels))
 
 
 def _cleanup_frame_interior_by_kind(
@@ -504,11 +540,14 @@ def _cleanup_frame_interior_by_kind(
     for x0, y0, x1, y1 in regions:
         _clear_light_in_rect(arr, x0, y0, x1, y1, threshold, frame_interior=True)
 
-    # Passagem 2: limpeza baseada na imagem ORIGINAL
-    # Pixels que eram brancos no original mas o rembg manteve → claramente fundo
-    # Arte do frame (ouro, azul) não é branca → não é afetada
+    # Passagem 2: componentes conectados no original
+    # Identifica precisamente o fundo branco das células sem depender de insets:
+    # para naturalmente nos divisores coloridos do frame.
     if original_arr is not None:
-        _clear_original_white_in_regions(arr, original_arr, regions, threshold)
+        seeds = _cell_center_seeds(h, w, kind)
+        bg_mask = _connected_background_mask(original_arr, h, w, seeds, threshold)
+        logger.debug("_cleanup_frame: bg_mask cobre %d px (%.1f%%)", bg_mask.sum(), 100 * bg_mask.mean())
+        arr[bg_mask, :] = 0  # força RGBA=0 em todo pixel que era fundo no original
 
     return arr
 
