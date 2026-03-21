@@ -112,17 +112,22 @@ def compress_to_webp_only(input_path: str, *, output_path: str) -> str:
 try:
     from rembg import new_session, remove as rembg_remove
 
-    logger.info("Carregando sessão rembg (birefnet-general)… pode demorar no 1º boot enquanto baixa o modelo (~300 MB)")
-    _t = time.perf_counter()
-    # birefnet-general: melhor modelo geral para assets ilustrados, logos e
-    # objetos com fundo sólido/gradiente. Não requer GPU mas usa se disponível.
-    _SESSION = new_session("birefnet-general")
-    _REMBG_AVAILABLE = True
     import onnxruntime as _ort
-    _providers = _ort.get_available_providers()
-    logger.info("Sessão rembg pronta (%.1fs) | ONNX providers: %s", time.perf_counter() - _t, _providers)
-    if "CUDAExecutionProvider" not in _providers:
-        logger.warning("⚠ GPU NÃO está sendo usada! Instale onnxruntime-gpu e verifique o CUDA.")
+    _available = _ort.get_available_providers()
+    logger.info("ONNX providers disponíveis: %s", _available)
+
+    # Usa GPU se disponível, com fallback para CPU
+    if "CUDAExecutionProvider" in _available:
+        _providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        logger.info("Carregando sessão rembg com CUDA (birefnet-general)…")
+    else:
+        _providers = ["CPUExecutionProvider"]
+        logger.warning("⚠ CUDAExecutionProvider não disponível — usando CPU (instale onnxruntime-gpu)")
+
+    _t = time.perf_counter()
+    _SESSION = new_session("birefnet-general", providers=_providers)
+    _REMBG_AVAILABLE = True
+    logger.info("Sessão rembg pronta em %.1fs | providers ativos: %s", time.perf_counter() - _t, _providers)
 except ImportError:
     logger.warning("rembg não instalado — usando fallback por threshold")
     _REMBG_AVAILABLE = False
