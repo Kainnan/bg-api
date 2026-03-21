@@ -14,6 +14,8 @@ from fastapi import HTTPException
 from app.services.image_service import (
     compress_to_webp_only,
     is_background_asset,
+    is_frame_asset,
+    is_logo_asset,
     remove_light_background,
 )
 
@@ -131,25 +133,92 @@ def _extract_index(path_str: str) -> str | None:
 
 
 def _mapped_output_name(original_path: Path, used_names: set[str]) -> str:
+    """
+    Retorna o caminho relativo de saída (podendo incluir subpasta).
+
+    Regras de nomeação:
+    - frame / grid  → frame.webp
+    - background    → body-bg.webp
+    - logo          → logo.webp
+    - wild          → symbols/W.webp
+    - high/scatter  → symbols/H<n>.webp
+    - low           → symbols/L<n>.webp
+    - outros        → <stem_sanitizado>.webp
+    """
     path_str = str(original_path)
+
+    # Frame (grid/moldura)
+    if is_frame_asset(path_str):
+        name = "frame.webp"
+        if name not in used_names:
+            used_names.add(name)
+            return name
+        # múltiplos frames: frame_2.webp, frame_3.webp …
+        n = 2
+        while True:
+            candidate = f"frame_{n}.webp"
+            if candidate not in used_names:
+                used_names.add(candidate)
+                return candidate
+            n += 1
+
+    # Background
+    if is_background_asset(path_str):
+        name = "body-bg.webp"
+        if name not in used_names:
+            used_names.add(name)
+            return name
+        n = 2
+        while True:
+            candidate = f"body-bg_{n}.webp"
+            if candidate not in used_names:
+                used_names.add(candidate)
+                return candidate
+            n += 1
+
+    # Logo
+    if is_logo_asset(path_str):
+        name = "logo.webp"
+        if name not in used_names:
+            used_names.add(name)
+            return name
+        n = 2
+        while True:
+            candidate = f"logo_{n}.webp"
+            if candidate not in used_names:
+                used_names.add(candidate)
+                return candidate
+            n += 1
+
+    # Símbolos e wild → pasta symbols/
     bucket = _extract_symbol_bucket(path_str)
-    idx = _extract_index(path_str)
-
     if bucket:
-        if idx:
-            base = f"{bucket}{idx}"
-        elif bucket == "W":
-            base = "W"
+        idx = _extract_index(path_str)
+        if bucket == "W":
+            base = "symbols/W"
+        elif idx:
+            base = f"symbols/{bucket}{idx}"
         else:
-            base = bucket
-    else:
-        base = re.sub(r"[^a-zA-Z0-9_\-]+", "_", original_path.stem) or "asset"
+            base = f"symbols/{bucket}"
 
+        name = f"{base}.webp"
+        if name not in used_names:
+            used_names.add(name)
+            return name
+        n = 2
+        while True:
+            candidate = f"{base}_{n}.webp"
+            if candidate not in used_names:
+                used_names.add(candidate)
+                return candidate
+            n += 1
+
+    # Fallback
+    base = re.sub(r"[^a-zA-Z0-9_\-]+", "_", original_path.stem) or "asset"
     name = f"{base}.webp"
     if name not in used_names:
         used_names.add(name)
         return name
-
     n = 2
     while True:
         candidate = f"{base}_{n}.webp"
@@ -186,6 +255,7 @@ def process_zip_bytes_to_output_zip_bytes(zip_bytes: bytes, *, threshold: int = 
         for i, src in enumerate(images, 1):
             out_name = _mapped_output_name(src, used_names)
             out_path = output_dir / out_name
+            out_path.parent.mkdir(parents=True, exist_ok=True)
             is_bg = is_background_asset(str(src))
             mode = "background" if is_bg else "rembg"
             logger.info("[%d/%d] %s → %s (%s)", i, len(images), src.name, out_name, mode)
@@ -215,9 +285,10 @@ def process_zip_bytes_to_output_zip_bytes(zip_bytes: bytes, *, threshold: int = 
 
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for file_path in sorted(output_dir.iterdir()):
+            for file_path in sorted(output_dir.rglob("*")):
                 if file_path.is_file():
-                    zf.write(file_path, arcname=file_path.name)
+                    arcname = file_path.relative_to(output_dir)
+                    zf.write(file_path, arcname=str(arcname))
         zip_buffer.seek(0)
         result = zip_buffer.read()
         logger.info("process_zip: ZIP de saída gerado (%.1f KB)", len(result) / 1024)

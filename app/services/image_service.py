@@ -196,6 +196,16 @@ def _is_frame_asset(input_path: str) -> bool:
     return "frame" in filename or "frame" in tokens
 
 
+def is_frame_asset(input_path: str) -> bool:
+    """Public wrapper para detecção de frame (grid/moldura)."""
+    return _is_frame_asset(input_path)
+
+
+def is_logo_asset(input_path: str) -> bool:
+    """True se o arquivo for um logo de jogo."""
+    return "logo" in Path(input_path).stem.lower()
+
+
 class FrameKind(str, Enum):
     """Três layouts de moldura / grid para limpeza do interior (fundo claro residual)."""
 
