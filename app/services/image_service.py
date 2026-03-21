@@ -335,22 +335,18 @@ def _clear_light_in_rect(
 
     if frame_interior:
         pc, mean_min, spread_max, weak_min = _frame_interior_thresholds(threshold)
-        # Critério A: canais altos, diff ampliado para capturar branco com tint azul/quente
-        mask = _vector_light_mask(r, g, b, threshold=pc, max_channel_diff=65)
+        # Critério A: canais altos e pouco saturados (diff relaxado para interiores)
+        mask = _vector_light_mask(r, g, b, threshold=pc, max_channel_diff=36)
         # Critério B: luminância alta + croma baixo (branco azulado, cinza-claro)
         mask = mask | _whitish_interior_mask(
             r, g, b, mean_min=mean_min, spread_max=spread_max, weakest_channel_min=weak_min
         )
-        # Critério C: qualquer pixel semi-transparente com luminância mínima
-        # rembg sempre deixa halos de borda nos interiores de células — devem ser removidos
-        mean3 = (r.astype(np.int32) + g.astype(np.int32) + b.astype(np.int32)) // 3
-        mask = mask | ((a > 0) & (a < 255) & (mean3 >= 80))
         if also_semi_opaque_light:
             mx = np.maximum(np.maximum(r, g), b)
             mn = np.minimum(np.minimum(r, g), b)
             spread = mx - mn
             mean = (r.astype(np.int32) + g.astype(np.int32) + b.astype(np.int32)) // 3
-            # Halo semi-opaco do rembg (critério original, mantido para compatibilidade)
+            # Halo semi-opaco do rembg
             mask = mask | (
                 (a > 20)
                 & (a < 252)
@@ -421,6 +417,42 @@ def _frame_regions_moldura(h: int, w: int) -> list[tuple[int, int, int, int]]:
     return [(x0b + ix, y0b + iy, x1b - ix, y1b - iy)]
 
 
+def _cell_deep_centers(h: int, w: int, kind: FrameKind) -> list[tuple[int, int, int, int]]:
+    """
+    Retorna regiões do centro profundo de cada célula (inset de 20%) para limpeza incondicional.
+    Essas regiões ficam longe de qualquer divisor — podem ser zeradas com segurança.
+    Override via FRAME_DEEP_INSET_FRAC (default 0.20).
+    """
+    deep_inset = float(os.getenv("FRAME_DEEP_INSET_FRAC", "0.20"))
+    margin = float(os.getenv("FRAME_MARGIN_FRAC", "0.07"))
+    y0b, y1b, x0b, x1b = _usable_inner_bounds(h, w, margin)
+    uw, uh = x1b - x0b, y1b - y0b
+
+    if kind is FrameKind.GRID_9:
+        cw, ch = max(1, uw // 3), max(1, uh // 3)
+        ix = max(1, int(cw * deep_inset))
+        iy = max(1, int(ch * deep_inset))
+        boxes = []
+        for gy in range(3):
+            for gx in range(3):
+                cx0 = x0b + gx * cw
+                cy0 = y0b + gy * ch
+                cx1, cy1 = cx0 + cw, cy0 + ch
+                boxes.append((cx0 + ix, cy0 + iy, cx1 - ix, cy1 - iy))
+        return boxes
+
+    if kind is FrameKind.REELS_3:
+        sw = max(1, uw // 3)
+        ix = max(1, int(sw * deep_inset))
+        iy = max(1, int(uh * deep_inset))
+        return [(x0b + gx * sw + ix, y0b + iy, x0b + (gx + 1) * sw - ix, y1b - iy) for gx in range(3)]
+
+    # MOLDURA
+    ix = max(1, int(uw * deep_inset))
+    iy = max(1, int(uh * deep_inset))
+    return [(x0b + ix, y0b + iy, x1b - ix, y1b - iy)]
+
+
 def _cleanup_frame_interior_by_kind(
     arr: np.ndarray,
     kind: FrameKind,
@@ -435,8 +467,20 @@ def _cleanup_frame_interior_by_kind(
     else:
         regions = _frame_regions_moldura(h, w)
 
+    # Passagem 1: limpeza por cor nas regiões com inset conservador
     for x0, y0, x1, y1 in regions:
         _clear_light_in_rect(arr, x0, y0, x1, y1, threshold, frame_interior=True)
+
+    # Passagem 2: limpeza incondicional do centro profundo de cada célula
+    # (inset de 20% — longe de qualquer divisor ou elemento decorativo do frame)
+    for x0, y0, x1, y1 in _cell_deep_centers(h, w, kind):
+        x0 = max(0, min(w, x0))
+        x1 = max(0, min(w, x1))
+        y0 = max(0, min(h, y0))
+        y1 = max(0, min(h, y1))
+        if x0 < x1 and y0 < y1:
+            arr[y0:y1, x0:x1] = [0, 0, 0, 0]
+
     return arr
 
 
