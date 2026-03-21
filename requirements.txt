@@ -3,4 +3,4 @@ uvicorn[standard]
 pillow
 python-multipart>=0.0.9
 rembg
-onnxruntime
+onnxruntime-gpu
