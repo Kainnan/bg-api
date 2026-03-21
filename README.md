@@ -16,6 +16,8 @@ bg-api/
 │       ├── image_service.py # WebP, rembg, fundos, frames
 │       └── zip_service.py   # extrai ZIP em memória, mapeia nomes, recompacta
 ├── requirements.txt
+├── setup_runpod.sh   # git pull + venv + pip (RunPod / servidor)
+├── run_api.sh        # uvicorn via .venv (não uses o uvicorn global)
 └── README.md
 ```
 
@@ -32,10 +34,22 @@ Na primeira execução o **rembg** pode baixar o modelo ONNX (~centenas de MB).
 ## Executar
 
 ```bash
-# Na raiz do projeto
+# Na raiz, com venv ativo:
+source .venv/bin/activate
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+# Garantir o mesmo interpretador (evita “python-multipart” em pods com uvicorn global):
+python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 # ou
 python app/main.py
+```
+
+**RunPod / Docker com `uvicorn` no PATH do sistema:** esse binário **não** usa o teu `.venv`. Usa `./run_api.sh` ou `.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000`.
+
+### RunPod (rápido)
+
+```bash
+./setup_runpod.sh
+./run_api.sh
 ```
 
 Variáveis úteis:

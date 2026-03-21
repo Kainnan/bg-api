@@ -23,11 +23,14 @@ source .venv/bin/activate
 echo "==> [3/4] pip + requirements.txt"
 python -m pip install --upgrade pip wheel
 pip install -r requirements.txt
+# Obrigatório para FastAPI com UploadFile/Form (evita erro se algo falhar no freeze)
+pip install "python-multipart>=0.0.9"
 
 echo "==> [4/4] concluído"
 echo ""
-echo "Arrancar a API:"
-echo "  source .venv/bin/activate"
-echo "  uvicorn app.main:app --host 0.0.0.0 --port 8000"
+echo "Arrancar a API (usa SEMPRE o venv — não uses o uvicorn do sistema):"
+echo "  ./run_api.sh"
+echo "  # ou:"
+echo "  .venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000"
 echo ""
 echo "Na RunPod, expõe a porta 8000 no template / mapeamento HTTP."
