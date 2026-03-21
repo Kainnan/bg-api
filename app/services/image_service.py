@@ -335,18 +335,22 @@ def _clear_light_in_rect(
 
     if frame_interior:
         pc, mean_min, spread_max, weak_min = _frame_interior_thresholds(threshold)
-        # Critério A: canais altos e pouco saturados (diff relaxado para interiores)
-        mask = _vector_light_mask(r, g, b, threshold=pc, max_channel_diff=36)
+        # Critério A: canais altos, diff ampliado para capturar branco com tint azul/quente
+        mask = _vector_light_mask(r, g, b, threshold=pc, max_channel_diff=65)
         # Critério B: luminância alta + croma baixo (branco azulado, cinza-claro)
         mask = mask | _whitish_interior_mask(
             r, g, b, mean_min=mean_min, spread_max=spread_max, weakest_channel_min=weak_min
         )
+        # Critério C: qualquer pixel semi-transparente com luminância mínima
+        # rembg sempre deixa halos de borda nos interiores de células — devem ser removidos
+        mean3 = (r.astype(np.int32) + g.astype(np.int32) + b.astype(np.int32)) // 3
+        mask = mask | ((a > 0) & (a < 255) & (mean3 >= 80))
         if also_semi_opaque_light:
             mx = np.maximum(np.maximum(r, g), b)
             mn = np.minimum(np.minimum(r, g), b)
             spread = mx - mn
             mean = (r.astype(np.int32) + g.astype(np.int32) + b.astype(np.int32)) // 3
-            # Halo semi-opaco do rembg
+            # Halo semi-opaco do rembg (critério original, mantido para compatibilidade)
             mask = mask | (
                 (a > 20)
                 & (a < 252)
