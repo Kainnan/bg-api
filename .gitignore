@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.so
+.eggs/
+*.egg-info/
+*.egg
+
+# Ambiente virtual
+.venv/
+venv/
+.env
+.env.local
+
+# IDE / SO
+.idea/
+.vscode/
+.DS_Store
+
+# Legado (API não persiste mais nada no disco do projeto)
+storage/
