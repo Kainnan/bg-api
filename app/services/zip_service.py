@@ -287,7 +287,7 @@ def process_zip_bytes_to_output_zip_bytes(zip_bytes: bytes, *, threshold: int = 
         with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             for file_path in sorted(output_dir.rglob("*")):
                 if file_path.is_file():
-                    arcname = file_path.relative_to(output_dir)
+                    arcname = Path("images") / file_path.relative_to(output_dir)
                     zf.write(file_path, arcname=str(arcname))
         zip_buffer.seek(0)
         result = zip_buffer.read()
