@@ -138,10 +138,12 @@ except Exception as _e:
 
 
 def _bria_remove(image: Image.Image) -> Image.Image:
-    """Remove o fundo usando BRIA RMBG 2.0. Retorna RGBA."""
+    """Remove o fundo usando BiRefNet. Retorna RGBA."""
     rgb = image.convert("RGB")
     original_size = rgb.size
     tensor = _BRIA_TRANSFORM(rgb).unsqueeze(0).to(_BRIA_DEVICE)
+    # Cast para o dtype do modelo (pode ser float16 quando carregado em GPU)
+    tensor = tensor.to(next(_BRIA_MODEL.parameters()).dtype)
     with torch.no_grad():
         preds = _BRIA_MODEL(tensor)[-1].sigmoid().cpu()
     mask = transforms.ToPILImage()(preds[0].squeeze())
