@@ -502,7 +502,12 @@ def _connected_background_mask(
     """
     thr = threshold - 10
     rgb = original_arr[:, :, :3].astype(np.int16)
-    is_light = (rgb[:, :, 0] >= thr) & (rgb[:, :, 1] >= thr) & (rgb[:, :, 2] >= thr)
+    r_ch, g_ch, b_ch = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
+    mx = np.maximum(np.maximum(r_ch, g_ch), b_ch)
+    mn = np.minimum(np.minimum(r_ch, g_ch), b_ch)
+    # Pixel é "fundo branco" somente se for claro E de baixa saturação (≈acromático).
+    # Glows coloridos (verde, azul) têm diff alto → NÃO são fundo → preservados como arte do frame.
+    is_light = (r_ch >= thr) & (g_ch >= thr) & (b_ch >= thr) & ((mx - mn) <= 15)
 
     labeled, _ = ndimage.label(is_light)
 
