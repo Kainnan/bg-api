@@ -561,7 +561,10 @@ def _cleanup_frame_interior_by_kind(
         seeds = _cell_center_seeds(h, w, kind)
         bg_mask = _connected_background_mask(original_arr, h, w, seeds, threshold)
         logger.debug("_cleanup_frame: bg_mask cobre %d px (%.1f%%)", bg_mask.sum(), 100 * bg_mask.mean())
-        arr[bg_mask, :] = 0  # força RGBA=0 em todo pixel que era fundo no original
+        # Erode 3px antes de aplicar: preserva os pixels de anti-aliasing nas bordas
+        # dos divisores que o rembg suavizou — evita cortes duros/grosseiros
+        safe_mask = ndimage.binary_erosion(bg_mask, iterations=3)
+        arr[safe_mask, :] = 0
 
         # Passagem 3: limpeza complementar por cor nas regiões de inset
         # Pixels "órfãos" que ficaram desconectados do seed por anti-aliasing
