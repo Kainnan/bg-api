@@ -528,7 +528,11 @@ def _connected_background_mask(
     if not bg_labels:
         return np.zeros((h, w), dtype=bool)
 
-    return np.isin(labeled, list(bg_labels))
+    # lookup table O(n_pixels) — muito mais rápido que np.isin para muitos labels
+    lut = np.zeros(labeled.max() + 1, dtype=bool)
+    for lbl in bg_labels:
+        lut[lbl] = True
+    return lut[labeled]
 
 
 def _cleanup_frame_interior_by_kind(
