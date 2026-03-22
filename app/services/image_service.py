@@ -535,6 +535,65 @@ def _connected_background_mask(
     return lut[labeled]
 
 
+def _is_light_background(original_arr: np.ndarray, threshold: int) -> bool:
+    """Verifica se o fundo da imagem é claro amostrando os cantos das 4 bordas."""
+    thr = threshold - 20
+    h, w = original_arr.shape[:2]
+    n = min(15, h // 4, w // 4)
+    corners = np.concatenate([
+        original_arr[:n, :n, :3].reshape(-1, 3),
+        original_arr[:n, -n:, :3].reshape(-1, 3),
+        original_arr[-n:, :n, :3].reshape(-1, 3),
+        original_arr[-n:, -n:, :3].reshape(-1, 3),
+    ])
+    light = (corners[:, 0] >= thr) & (corners[:, 1] >= thr) & (corners[:, 2] >= thr)
+    return bool(light.mean() > 0.7)
+
+
+def _remove_frame_by_components(
+    original_arr: np.ndarray,
+    kind: FrameKind,
+    threshold: int,
+) -> np.ndarray:
+    """
+    Remove o fundo de um frame usando APENAS componentes conectados — sem rembg.
+
+    Vantagens sobre rembg para frames com fundo branco:
+    - Borda externa preservada 100% (nunca tocamos pixels do frame art)
+    - Resultado determinístico, sem variação entre runs
+    - Muito mais rápido (sem inferência de modelo)
+    - Funciona para qualquer estilo de frame, qualquer cor de divisor
+
+    Algoritmo:
+    1. Marca pixels claros no original (R,G,B >= thr)
+    2. Labels de componentes conectados (4-conectividade)
+    3. Fundo externo  = componentes tocando bordas da imagem
+       Fundo interno  = componentes tocando centros das células
+    4. Ambos recebem alpha=0; tudo mais recebe alpha=255 (arte do frame intacta)
+    5. Aplica Gaussian feather de 1px na fronteira para suavizar a borda externa
+    """
+    h, w = original_arr.shape[:2]
+    seeds = _cell_center_seeds(h, w, kind)
+    bg_mask = _connected_background_mask(original_arr, h, w, seeds, threshold)
+    logger.debug("_remove_frame_by_components: bg_mask=%.1f%% do total", 100 * bg_mask.mean())
+
+    result = original_arr.copy()
+    result[bg_mask, 3] = 0
+    result[~bg_mask, 3] = 255
+
+    # Feather de 1px na fronteira: suaviza a borda externa do frame
+    alpha_f = result[:, :, 3].astype(np.float32)
+    blurred = ndimage.gaussian_filter(alpha_f, sigma=0.8)
+    boundary = (
+        ndimage.binary_dilation(bg_mask, iterations=2)
+        & ~ndimage.binary_erosion(bg_mask, iterations=2)
+    )
+    alpha_f[boundary] = blurred[boundary]
+    result[:, :, 3] = np.clip(alpha_f, 0, 255).astype(np.uint8)
+
+    return result
+
+
 def _cleanup_frame_interior_by_kind(
     arr: np.ndarray,
     kind: FrameKind,
@@ -606,36 +665,29 @@ def remove_background(
     logger.debug("remove_background: imagem aberta %dx%d modo=%s", image.width, image.height, image.mode)
 
     is_frame = _is_frame_asset(input_path)
-    # Captura o array original antes do rembg para uso no cleanup de frames
-    original_arr = np.array(image.convert("RGBA")) if is_frame else None
 
-    if _REMBG_AVAILABLE:
-        logger.debug("remove_background: chamando rembg…")
-        try:
-            result: Image.Image = rembg_remove(image, session=_SESSION)
-        except Exception as exc:
-            logger.error(
-                "remove_background: rembg falhou (%s) — aplicando fallback por threshold=%d",
-                exc, thr,
-            )
-            result = _remove_by_threshold(image, thr)
-    else:
-        result = _remove_by_threshold(image, thr)
-
-    result = result.convert("RGBA")
-
-    # Para frames, não usar fill_holes no alpha inteiro (preserva buracos internos).
-    # Tipos: grid 3×3, 3 reels (faixas), moldura única — limpeza direcionada no interior.
-    arr = np.array(result)
-    alpha = arr[:, :, 3]
-    if not is_frame:
-        pass  # rembg lida bem com símbolos/logos; fill_holes tornava buracos internos opacos-pretos
-    else:
+    if is_frame:
+        # Frames: sempre componentes conectados puro (fundo sempre branco).
+        # Sem rembg — borda 100% preservada, determinístico, rápido.
+        original_arr = np.array(image.convert("RGBA"))
         kind = _detect_frame_kind(input_path)
-        logger.info("remove_background: frame detectado — tipo=%s arquivo=%s", kind.value, input_file.name)
-        arr = _cleanup_frame_interior_by_kind(arr, kind, thr, original_arr=original_arr)
-
-    result = Image.fromarray(arr, "RGBA")
+        logger.info("remove_background: frame tipo=%s → componentes conectados", kind.value)
+        arr = _remove_frame_by_components(original_arr, kind, thr)
+        result = Image.fromarray(arr, "RGBA")
+    else:
+        # Símbolos e logos: rembg (lida bem com bordas complexas e formas orgânicas)
+        if _REMBG_AVAILABLE:
+            logger.debug("remove_background: chamando rembg…")
+            try:
+                result: Image.Image = rembg_remove(image, session=_SESSION)
+            except Exception as exc:
+                logger.error(
+                    "remove_background: rembg falhou (%s) — fallback threshold=%d", exc, thr,
+                )
+                result = _remove_by_threshold(image, thr)
+        else:
+            result = _remove_by_threshold(image, thr)
+        result = result.convert("RGBA")
 
     # Trim + resize: símbolos/logos são cropados e padronizados em 900×900
     # Frames não são alterados — precisam manter dimensões originais para o layout do jogo
