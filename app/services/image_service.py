@@ -675,7 +675,7 @@ def remove_background(
     input_file = Path(input_path)
     thr = int(threshold if threshold is not None else 245)
 
-    logger.debug("remove_background: %s (threshold=%d, rembg=%s)", input_file.name, thr, _REMBG_AVAILABLE)
+    logger.debug("remove_background: %s (threshold=%d, birefnet=%s)", input_file.name, thr, _BRIA_MODEL is not None)
     t0 = time.perf_counter()
 
     image = Image.open(input_file)
