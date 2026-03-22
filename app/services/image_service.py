@@ -123,17 +123,17 @@ try:
     from transformers import AutoModelForImageSegmentation
 
     torch.set_float32_matmul_precision("high")
-    logger.info("Carregando BRIA RMBG 2.0 em %s…", _BRIA_DEVICE)
+    logger.info("Carregando BiRefNet (ZhengPeng7) em %s…", _BRIA_DEVICE)
     _t = time.perf_counter()
     _BRIA_MODEL = (
         AutoModelForImageSegmentation
-        .from_pretrained("briaai/RMBG-2.0", trust_remote_code=True)
+        .from_pretrained("ZhengPeng7/BiRefNet", trust_remote_code=True)
         .eval()
         .to(_BRIA_DEVICE)
     )
-    logger.info("BRIA RMBG 2.0 pronto em %.1fs | device=%s", time.perf_counter() - _t, _BRIA_DEVICE)
+    logger.info("BiRefNet pronto em %.1fs | device=%s", time.perf_counter() - _t, _BRIA_DEVICE)
 except Exception as _e:
-    logger.error("Falha ao carregar BRIA RMBG 2.0: %s — usando fallback por threshold", _e)
+    logger.error("Falha ao carregar BiRefNet: %s — usando fallback por threshold", _e)
     _BRIA_MODEL = None
 
 
@@ -694,7 +694,7 @@ def remove_background(
     else:
         # Símbolos e logos: BRIA RMBG 2.0
         if _BRIA_MODEL is not None:
-            logger.debug("remove_background: chamando BRIA RMBG 2.0…")
+            logger.debug("remove_background: chamando BiRefNet…")
             try:
                 result: Image.Image = _bria_remove(image)
             except Exception as exc:
