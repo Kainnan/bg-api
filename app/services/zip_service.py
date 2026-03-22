@@ -257,7 +257,7 @@ def process_zip_bytes_to_output_zip_bytes(zip_bytes: bytes, *, threshold: int = 
             out_path = output_dir / out_name
             out_path.parent.mkdir(parents=True, exist_ok=True)
             is_bg = is_background_asset(str(src))
-            mode = "background" if is_bg else "rembg"
+            mode = "background" if is_bg else "birefnet"
             logger.info("[%d/%d] %s → %s (%s)", i, len(images), src.name, out_name, mode)
 
             t_img = time.perf_counter()
