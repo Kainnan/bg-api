@@ -622,8 +622,7 @@ def remove_background(
     arr = np.array(result)
     alpha = arr[:, :, 3]
     if not is_frame:
-        logger.debug("remove_background: aplicando fill_holes no alpha")
-        arr[:, :, 3] = ndimage.binary_fill_holes(alpha > 128).astype(np.uint8) * 255
+        pass  # rembg lida bem com símbolos/logos; fill_holes tornava buracos internos opacos-pretos
     else:
         kind = _detect_frame_kind(input_path)
         logger.info("remove_background: frame detectado — tipo=%s arquivo=%s", kind.value, input_file.name)
