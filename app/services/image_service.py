@@ -10,6 +10,8 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 from scipy import ndimage
+import torch
+from torchvision import transforms
 
 logger = logging.getLogger("bg_api.image_service")
 
@@ -106,36 +108,46 @@ def compress_to_webp_only(input_path: str, *, output_path: str) -> str:
     return str(final_output.resolve())
 
 # ---------------------------------------------------------------------------
-# rembg session — carregado uma única vez no import do módulo para evitar
-# reinicialização a cada requisição (cada sessão carrega ~300 MB em memória).
+# BRIA RMBG 2.0 — modelo de segmentação estado da arte para remoção de fundo.
+# Carregado uma única vez no startup; usa CUDA quando disponível.
 # ---------------------------------------------------------------------------
+_BRIA_MODEL = None
+_BRIA_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+_BRIA_TRANSFORM = transforms.Compose([
+    transforms.Resize((1024, 1024)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+])
+
 try:
-    from rembg import new_session, remove as rembg_remove
+    from transformers import AutoModelForImageSegmentation
 
-    import onnxruntime as _ort
-    _available = _ort.get_available_providers()
-    logger.info("ONNX providers disponíveis: %s", _available)
-
-    # Usa GPU se disponível, com fallback para CPU
-    if "CUDAExecutionProvider" in _available:
-        _providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        logger.info("Carregando sessão rembg com CUDA (birefnet-general)…")
-    else:
-        _providers = ["CPUExecutionProvider"]
-        logger.warning("⚠ CUDAExecutionProvider não disponível — usando CPU (instale onnxruntime-gpu)")
-
+    torch.set_float32_matmul_precision("high")
+    logger.info("Carregando BRIA RMBG 2.0 em %s…", _BRIA_DEVICE)
     _t = time.perf_counter()
-    _SESSION = new_session("birefnet-general", providers=_providers)
-    _REMBG_AVAILABLE = True
-    logger.info("Sessão rembg pronta em %.1fs | providers ativos: %s", time.perf_counter() - _t, _providers)
-except ImportError:
-    logger.warning("rembg não instalado — usando fallback por threshold")
-    _REMBG_AVAILABLE = False
-    _SESSION = None
+    _BRIA_MODEL = (
+        AutoModelForImageSegmentation
+        .from_pretrained("briaai/RMBG-2.0", trust_remote_code=True)
+        .eval()
+        .to(_BRIA_DEVICE)
+    )
+    logger.info("BRIA RMBG 2.0 pronto em %.1fs | device=%s", time.perf_counter() - _t, _BRIA_DEVICE)
 except Exception as _e:
-    logger.error("Falha ao inicializar rembg: %s — usando fallback por threshold", _e)
-    _REMBG_AVAILABLE = False
-    _SESSION = None
+    logger.error("Falha ao carregar BRIA RMBG 2.0: %s — usando fallback por threshold", _e)
+    _BRIA_MODEL = None
+
+
+def _bria_remove(image: Image.Image) -> Image.Image:
+    """Remove o fundo usando BRIA RMBG 2.0. Retorna RGBA."""
+    rgb = image.convert("RGB")
+    original_size = rgb.size
+    tensor = _BRIA_TRANSFORM(rgb).unsqueeze(0).to(_BRIA_DEVICE)
+    with torch.no_grad():
+        preds = _BRIA_MODEL(tensor)[-1].sigmoid().cpu()
+    mask = transforms.ToPILImage()(preds[0].squeeze())
+    mask = mask.resize(original_size, Image.LANCZOS)
+    rgb.putalpha(mask)
+    return rgb
 
 
 # ---------------------------------------------------------------------------
@@ -680,15 +692,13 @@ def remove_background(
         arr = _remove_frame_by_components(original_arr, kind, thr)
         result = Image.fromarray(arr, "RGBA")
     else:
-        # Símbolos e logos: rembg (lida bem com bordas complexas e formas orgânicas)
-        if _REMBG_AVAILABLE:
-            logger.debug("remove_background: chamando rembg…")
+        # Símbolos e logos: BRIA RMBG 2.0
+        if _BRIA_MODEL is not None:
+            logger.debug("remove_background: chamando BRIA RMBG 2.0…")
             try:
-                result: Image.Image = rembg_remove(image, session=_SESSION)
+                result: Image.Image = _bria_remove(image)
             except Exception as exc:
-                logger.error(
-                    "remove_background: rembg falhou (%s) — fallback threshold=%d", exc, thr,
-                )
+                logger.error("BRIA falhou (%s) — fallback threshold=%d", exc, thr)
                 result = _remove_by_threshold(image, thr)
         else:
             result = _remove_by_threshold(image, thr)

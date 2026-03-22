@@ -2,5 +2,9 @@ fastapi
 uvicorn[standard]
 pillow
 python-multipart>=0.0.9
-rembg
-onnxruntime-gpu
+scipy
+numpy
+torch
+torchvision
+transformers
+kornia
