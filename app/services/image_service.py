@@ -634,13 +634,22 @@ def remove_background(
 
     result = Image.fromarray(arr, "RGBA")
 
-    # Trim: remove excesso de transparência ao redor de símbolos/logos
-    # Frames não são trimados — precisam manter dimensões originais para o layout do jogo
+    # Trim + resize: símbolos/logos são cropados e padronizados em 900×900
+    # Frames não são alterados — precisam manter dimensões originais para o layout do jogo
     if not is_frame:
         bbox = result.getbbox()  # bounding box dos pixels não-transparentes
         if bbox:
             result = result.crop(bbox)
-            logger.debug("remove_background: trim %s → %s", arr.shape[:2], result.size)
+            logger.debug("remove_background: trim → %s", result.size)
+        target = 900
+        # Redimensiona preservando proporção, depois centraliza em canvas 900×900
+        result.thumbnail((target, target), Image.LANCZOS)
+        canvas = Image.new("RGBA", (target, target), (0, 0, 0, 0))
+        x = (target - result.width) // 2
+        y = (target - result.height) // 2
+        canvas.paste(result, (x, y))
+        result = canvas
+        logger.debug("remove_background: resize → %dx%d", target, target)
 
     final_output = Path(output_path)
     save_rgba_as_webp(result, final_output)
