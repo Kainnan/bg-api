@@ -143,9 +143,12 @@ def _bria_remove(image: Image.Image) -> Image.Image:
 
     Pipeline:
       1. BiRefNet → máscara crua (1024×1024 upscaled)
-      2. Guided filter → refina bordas usando imagem original como guia
-      3. Feathering adaptativo → transições nítidas ou suaves conforme gradiente
-      4. Color decontamination → remove sangramento de cor do fundo nas bordas
+      2. Estimativa da cor do fundo (a partir dos pixels de baixa confiança)
+      3. Chroma augmentation → recupera glows/raios/chamas que o BiRefNet
+         classificou como background (efeitos VFX coloridos semi-transparentes)
+      4. Guided filter → refina bordas usando imagem original como guia
+      5. Feathering adaptativo → transições nítidas ou suaves conforme gradiente
+      6. Color decontamination → remove sangramento de cor do fundo nas bordas
     Retorna RGBA.
     """
     rgb = image.convert("RGB")
@@ -166,25 +169,33 @@ def _bria_remove(image: Image.Image) -> Image.Image:
     rgb_f = rgb_arr.astype(np.float32) / 255.0                 # (H, W, 3) [0,1]
     mask_f = np.array(raw_mask_pil).astype(np.float32) / 255.0  # (H, W)   [0,1]
 
-    # ── 2. Guided filter — refina bordas com resolução original como guia ─
+    # ── 2. Cor do fundo (estimada na máscara crua, antes de modificações) ─
+    bg_color = _estimate_bg_color(rgb_arr.astype(np.float32), mask_f)
+    logger.debug("_bria_remove: bg_color estimado=%s", bg_color.astype(int))
+
+    # ── 3. Chroma augmentation — recupera efeitos coloridos perdidos ──────
     t1 = time.perf_counter()
-    mask_f = _guided_filter_mask(rgb_f, mask_f, radius=8, eps=1e-4)
-    logger.debug("_bria_remove: guided filter em %.2fs", time.perf_counter() - t1)
+    mask_f = _chroma_augment_mask(rgb_arr, mask_f, bg_color)
+    logger.debug("_bria_remove: chroma augment em %.2fs", time.perf_counter() - t1)
 
-    # ── 3. Feathering adaptativo — bordas nítidas vs suaves ───────────────
+    # ── 4. Guided filter — refina bordas com resolução original como guia ─
     t2 = time.perf_counter()
-    mask_f = _adaptive_feather(rgb_f, mask_f)
-    logger.debug("_bria_remove: adaptive feather em %.2fs", time.perf_counter() - t2)
+    mask_f = _guided_filter_mask(rgb_f, mask_f, radius=8, eps=1e-4)
+    logger.debug("_bria_remove: guided filter em %.2fs", time.perf_counter() - t2)
 
-    # ── 4. Montar RGBA ────────────────────────────────────────────────────
+    # ── 5. Feathering adaptativo — bordas nítidas vs suaves ───────────────
+    t3 = time.perf_counter()
+    mask_f = _adaptive_feather(rgb_f, mask_f)
+    logger.debug("_bria_remove: adaptive feather em %.2fs", time.perf_counter() - t3)
+
+    # ── 6. Montar RGBA ────────────────────────────────────────────────────
     alpha = (np.clip(mask_f, 0, 1) * 255).astype(np.uint8)
     rgba = np.dstack([rgb_arr, alpha])
 
-    # ── 5. Color decontamination — remove halo de cor do fundo ────────────
-    t3 = time.perf_counter()
-    bg_color = _estimate_bg_color(rgb_arr.astype(np.float32), mask_f)
+    # ── 7. Color decontamination — remove halo de cor do fundo ────────────
+    t4 = time.perf_counter()
     rgba = _decontaminate_colors(rgba, bg_color)
-    logger.debug("_bria_remove: decontamination em %.2fs (bg_color=%s)", time.perf_counter() - t3, bg_color.astype(int))
+    logger.debug("_bria_remove: decontamination em %.2fs", time.perf_counter() - t4)
 
     logger.debug("_bria_remove: pipeline completo em %.2fs", time.perf_counter() - t0)
     return Image.fromarray(rgba, "RGBA")
@@ -193,6 +204,68 @@ def _bria_remove(image: Image.Image) -> Image.Image:
 # ---------------------------------------------------------------------------
 # Pós-processamento de máscara e cores — qualidade profissional
 # ---------------------------------------------------------------------------
+
+def _chroma_augment_mask(
+    rgb_arr: np.ndarray,
+    mask: np.ndarray,
+    bg_color: np.ndarray,
+    *,
+    color_threshold: float = 0.10,
+    max_boost: float = 0.85,
+    proximity_frac: float = 0.06,
+) -> np.ndarray:
+    """
+    Recupera efeitos coloridos semi-transparentes (glows, raios, chamas)
+    que o BiRefNet classificou como background.
+
+    BiRefNet foi treinado em fotos de objetos físicos — efeitos VFX de jogo
+    são fora da distribuição. Glows azuis/laranjas/coloridos com baixa
+    opacidade frequentemente recebem alpha=0 do modelo, mesmo sendo parte
+    visível do asset.
+
+    Estratégia:
+      1. Mede distância de cor (max diff por canal) entre cada pixel e o
+         fundo estimado.
+      2. Aplica soft threshold para detectar pixels visivelmente coloridos.
+      3. Pondera por proximidade ao foreground (distance transform) — evita
+         capturar ruído em regiões distantes do objeto.
+      4. Combina com a máscara original via max() — só aumenta, nunca reduz.
+
+    Limitação fundamental: glows brancos puros sobre fundo branco são
+    matematicamente indistinguíveis. Só recupera efeitos com cor.
+
+    Parâmetros:
+      color_threshold: distância mínima de cor (0-1) para considerar pixel
+                       como "colorido". Default 0.10 = 10% de diff.
+      max_boost: alpha máximo aplicado pela augmentation (cap). Default 0.85.
+      proximity_frac: sigma do falloff de proximidade como fração da
+                      diagonal da imagem. Default 0.06 = 6%.
+    """
+    fg = mask > 0.5
+    if not fg.any():
+        # Nada de foreground detectado — não há a que se ancorar
+        return mask
+
+    # 1. Distância de cor por pixel (max channel diff, normalizado)
+    diff = np.abs(rgb_arr.astype(np.float32) - bg_color.reshape(1, 1, 3))
+    color_dist = diff.max(axis=2) / 255.0  # (H, W) [0, 1]
+
+    # 2. Soft threshold: pixels acima do threshold ganham peso linearmente
+    chroma_mask = np.clip((color_dist - color_threshold) * 4.0, 0.0, 1.0)
+
+    # 3. Proximidade ao foreground via distance transform
+    h, w = mask.shape
+    diag = float(np.sqrt(h * h + w * w))
+    sigma = max(10.0, diag * proximity_frac)
+    distance = ndimage.distance_transform_edt(~fg).astype(np.float32)
+    proximity = np.exp(-distance / sigma)
+
+    # 4. Augmentation final: chroma × proximidade × cap
+    augmentation = chroma_mask * proximity * max_boost
+
+    # 5. Combina com a máscara: max() — preserva foreground original intacto
+    return np.maximum(mask, augmentation)
+
 
 def _guided_filter_mask(
     guide_rgb: np.ndarray,
