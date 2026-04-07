@@ -137,18 +137,40 @@ except Exception as _e:
     _BRIA_MODEL = None
 
 
+def _detect_bg_mode(rgb_arr: np.ndarray) -> str:
+    """
+    Detecta o tipo de fundo da imagem amostrando os 4 cantos.
+
+    Retorna:
+      "dark"   — fundo preto/escuro (lum < 20/255 nos cantos)
+      "light"  — fundo branco/claro (lum > 235/255 nos cantos)
+      "mixed"  — qualquer outra coisa (fallback heurístico)
+    """
+    h, w = rgb_arr.shape[:2]
+    s = max(8, min(h, w) // 32)  # tamanho do patch dos cantos
+    corners = np.concatenate([
+        rgb_arr[:s, :s].reshape(-1, 3),
+        rgb_arr[:s, -s:].reshape(-1, 3),
+        rgb_arr[-s:, :s].reshape(-1, 3),
+        rgb_arr[-s:, -s:].reshape(-1, 3),
+    ])
+    mean_lum = float(corners.mean())
+    if mean_lum < 20.0:
+        return "dark"
+    if mean_lum > 235.0:
+        return "light"
+    return "mixed"
+
+
 def _bria_remove(image: Image.Image) -> Image.Image:
     """
-    Remove o fundo usando BiRefNet + pós-processamento de qualidade.
+    Remove o fundo usando BiRefNet + pós-processamento adaptativo ao tipo de bg.
 
-    Pipeline:
-      1. BiRefNet → máscara crua (1024×1024 upscaled)
-      2. Estimativa da cor do fundo (a partir dos pixels de baixa confiança)
-      3. Chroma augmentation → recupera glows/raios/chamas que o BiRefNet
-         classificou como background (efeitos VFX coloridos semi-transparentes)
-      4. Guided filter → refina bordas usando imagem original como guia
-      5. Feathering adaptativo → transições nítidas ou suaves conforme gradiente
-      6. Color decontamination → remove sangramento de cor do fundo nas bordas
+    Detecta o fundo (preto/branco/misto) pelos cantos da imagem e roteia pra
+    o pipeline dedicado:
+      - "dark"  → pipeline matemático (premultiplied alpha)
+      - "light" → pipeline heurístico (chroma augmentation + decontamination)
+      - "mixed" → fallback (mesmo do light, sem garantias)
     Retorna RGBA.
     """
     rgb = image.convert("RGB")
@@ -164,53 +186,131 @@ def _bria_remove(image: Image.Image) -> Image.Image:
     raw_mask_pil = raw_mask_pil.resize(original_size, Image.LANCZOS)
     logger.debug("_bria_remove: inferência em %.2fs", time.perf_counter() - t0)
 
-    # Arrays float32 para pós-processamento
-    rgb_arr = np.array(rgb)                                    # (H, W, 3) uint8
-    rgb_f = rgb_arr.astype(np.float32) / 255.0                 # (H, W, 3) [0,1]
-    mask_f = np.array(raw_mask_pil).astype(np.float32) / 255.0  # (H, W)   [0,1]
+    rgb_arr = np.array(rgb)
+    rgb_f = rgb_arr.astype(np.float32) / 255.0
+    mask_f = np.array(raw_mask_pil).astype(np.float32) / 255.0
 
-    # ── 2. Cor do fundo (estimada na máscara crua, antes de modificações) ─
+    bg_mode = _detect_bg_mode(rgb_arr)
+    logger.info("_bria_remove: bg_mode detectado=%s", bg_mode)
+
+    if bg_mode == "dark":
+        rgba = _process_dark_bg(rgb_arr, rgb_f, mask_f)
+    else:
+        rgba = _process_light_bg(rgb_arr, rgb_f, mask_f)
+
+    logger.debug("_bria_remove: pipeline completo em %.2fs", time.perf_counter() - t0)
+    return Image.fromarray(rgba, "RGBA")
+
+
+def _process_dark_bg(
+    rgb_arr: np.ndarray,
+    rgb_f: np.ndarray,
+    birefnet_mask: np.ndarray,
+) -> np.ndarray:
+    """
+    Pipeline matemático pra fundo preto puro.
+
+    Em fundo preto, cada pixel observado é premultiplied alpha:
+        C_obs = C_real × α + 0 × (1 − α) = C_real × α
+
+    Logo:
+        α_natural = max(R, G, B) / 255           (alpha exato por pixel)
+        C_real    = C_obs / α_natural             (decontamination exata)
+
+    O alpha final combina o BiRefNet (objeto sólido) com o alpha natural
+    (glows e VFX), restrito a uma região de interesse expandida do BiRefNet
+    pra não capturar ruído distante do objeto.
+    """
+    t0 = time.perf_counter()
+
+    # 1. Alpha natural — premultiplied alpha matematicamente exato
+    alpha_natural = rgb_f.max(axis=2)  # (H, W) [0, 1]
+
+    # 2. Região de interesse: expandir o BiRefNet pra alcançar glows próximos
+    fg_seed = birefnet_mask > 0.5
+    if fg_seed.any():
+        h, w = birefnet_mask.shape
+        diag = float(np.sqrt(h * h + w * w))
+        sigma = max(20.0, diag * 0.12)
+        distance = ndimage.distance_transform_edt(~fg_seed).astype(np.float32)
+        roi = np.exp(-distance / sigma)  # falloff suave do objeto pra fora
+    else:
+        roi = np.ones_like(birefnet_mask)
+
+    # 3. Combina: dentro do BiRefNet usa max(birefnet, natural).
+    #    Fora, usa só alpha_natural × roi (decai com distância).
+    combined = np.maximum(birefnet_mask, alpha_natural * roi)
+
+    # 4. Refino de borda com guided filter (mais suave que no light mode)
+    t1 = time.perf_counter()
+    combined = _guided_filter_mask(rgb_f, combined, radius=4, eps=1e-3)
+    logger.debug("_process_dark_bg: guided filter em %.2fs", time.perf_counter() - t1)
+
+    alpha = np.clip(combined, 0.0, 1.0)
+
+    # 5. Decontamination matemática exata: rgb / alpha
+    #    (só onde alpha > epsilon pra evitar divisão por zero)
+    rgb_unmix = np.zeros_like(rgb_f)
+    safe = alpha > 0.01
+    rgb_unmix[safe] = rgb_f[safe] / alpha[safe, np.newaxis]
+    rgb_unmix = np.clip(rgb_unmix, 0.0, 1.0)
+
+    rgba = np.zeros((rgb_arr.shape[0], rgb_arr.shape[1], 4), dtype=np.uint8)
+    rgba[..., :3] = (rgb_unmix * 255).astype(np.uint8)
+    rgba[..., 3] = (alpha * 255).astype(np.uint8)
+
+    n_opaque = int((rgba[..., 3] > 240).sum())
+    n_semi = int(((rgba[..., 3] > 5) & (rgba[..., 3] <= 240)).sum())
+    logger.info(
+        "_process_dark_bg: total %.2fs — opaque=%d semi=%d",
+        time.perf_counter() - t0, n_opaque, n_semi,
+    )
+    return rgba
+
+
+def _process_light_bg(
+    rgb_arr: np.ndarray,
+    rgb_f: np.ndarray,
+    mask_f: np.ndarray,
+) -> np.ndarray:
+    """
+    Pipeline heurístico pra fundo branco/claro (e fallback pra fundos mistos).
+    Mantém a lógica original: chroma augmentation + guided filter +
+    adaptive feather + decontamination.
+    """
+    t0 = time.perf_counter()
     bg_color = _estimate_bg_color(rgb_arr.astype(np.float32), mask_f)
-    logger.debug("_bria_remove: bg_color estimado=%s", bg_color.astype(int))
+    logger.debug("_process_light_bg: bg_color=%s", bg_color.astype(int))
 
-    # ── 3. Chroma augmentation — recupera efeitos coloridos perdidos ──────
     t1 = time.perf_counter()
     mask_before = mask_f.copy()
     mask_f, augmented_region = _chroma_augment_mask(rgb_arr, mask_f, bg_color)
     delta = mask_f - mask_before
     n_aug = int((delta > 0.01).sum())
     logger.info(
-        "_bria_remove: chroma augment em %.2fs — pixels recuperados=%d, max boost=%.3f, mean boost=%.3f",
+        "_process_light_bg: chroma augment em %.2fs — recuperados=%d max=%.3f mean=%.3f",
         time.perf_counter() - t1,
         n_aug,
         float(delta.max()) if n_aug else 0.0,
         float(delta[delta > 0.01].mean()) if n_aug else 0.0,
     )
 
-    # ── 4. Guided filter — refina bordas com resolução original como guia ─
     t2 = time.perf_counter()
     mask_f = _guided_filter_mask(rgb_f, mask_f, radius=8, eps=1e-4)
-    logger.debug("_bria_remove: guided filter em %.2fs", time.perf_counter() - t2)
+    logger.debug("_process_light_bg: guided filter em %.2fs", time.perf_counter() - t2)
 
-    # ── 5. Feathering adaptativo — bordas nítidas vs suaves ───────────────
     t3 = time.perf_counter()
     mask_f = _adaptive_feather(rgb_f, mask_f)
-    logger.debug("_bria_remove: adaptive feather em %.2fs", time.perf_counter() - t3)
+    logger.debug("_process_light_bg: adaptive feather em %.2fs", time.perf_counter() - t3)
 
-    # ── 6. Montar RGBA ────────────────────────────────────────────────────
     alpha = (np.clip(mask_f, 0, 1) * 255).astype(np.uint8)
     rgba = np.dstack([rgb_arr, alpha])
 
-    # ── 7. Color decontamination — remove halo de cor do fundo ────────────
-    # Pixels recuperados pela chroma augmentation NÃO devem ser
-    # decontaminados: eles não são mistura física com o bg, são o efeito
-    # real (glow/raio). Decontaminar reverteria uma mistura inexistente.
     t4 = time.perf_counter()
     rgba = _decontaminate_colors(rgba, bg_color, skip_mask=augmented_region)
-    logger.debug("_bria_remove: decontamination em %.2fs", time.perf_counter() - t4)
-
-    logger.debug("_bria_remove: pipeline completo em %.2fs", time.perf_counter() - t0)
-    return Image.fromarray(rgba, "RGBA")
+    logger.debug("_process_light_bg: decontamination em %.2fs", time.perf_counter() - t4)
+    logger.info("_process_light_bg: total %.2fs", time.perf_counter() - t0)
+    return rgba
 
 
 # ---------------------------------------------------------------------------
