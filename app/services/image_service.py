@@ -175,8 +175,17 @@ def _bria_remove(image: Image.Image) -> Image.Image:
 
     # ── 3. Chroma augmentation — recupera efeitos coloridos perdidos ──────
     t1 = time.perf_counter()
-    mask_f = _chroma_augment_mask(rgb_arr, mask_f, bg_color)
-    logger.debug("_bria_remove: chroma augment em %.2fs", time.perf_counter() - t1)
+    mask_before = mask_f.copy()
+    mask_f, augmented_region = _chroma_augment_mask(rgb_arr, mask_f, bg_color)
+    delta = mask_f - mask_before
+    n_aug = int((delta > 0.01).sum())
+    logger.info(
+        "_bria_remove: chroma augment em %.2fs — pixels recuperados=%d, max boost=%.3f, mean boost=%.3f",
+        time.perf_counter() - t1,
+        n_aug,
+        float(delta.max()) if n_aug else 0.0,
+        float(delta[delta > 0.01].mean()) if n_aug else 0.0,
+    )
 
     # ── 4. Guided filter — refina bordas com resolução original como guia ─
     t2 = time.perf_counter()
@@ -193,8 +202,11 @@ def _bria_remove(image: Image.Image) -> Image.Image:
     rgba = np.dstack([rgb_arr, alpha])
 
     # ── 7. Color decontamination — remove halo de cor do fundo ────────────
+    # Pixels recuperados pela chroma augmentation NÃO devem ser
+    # decontaminados: eles não são mistura física com o bg, são o efeito
+    # real (glow/raio). Decontaminar reverteria uma mistura inexistente.
     t4 = time.perf_counter()
-    rgba = _decontaminate_colors(rgba, bg_color)
+    rgba = _decontaminate_colors(rgba, bg_color, skip_mask=augmented_region)
     logger.debug("_bria_remove: decontamination em %.2fs", time.perf_counter() - t4)
 
     logger.debug("_bria_remove: pipeline completo em %.2fs", time.perf_counter() - t0)
@@ -210,10 +222,10 @@ def _chroma_augment_mask(
     mask: np.ndarray,
     bg_color: np.ndarray,
     *,
-    color_threshold: float = 0.10,
-    max_boost: float = 0.85,
-    proximity_frac: float = 0.06,
-) -> np.ndarray:
+    signal_threshold: float = 0.04,
+    max_boost: float = 0.95,
+    proximity_frac: float = 0.14,
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Recupera efeitos coloridos semi-transparentes (glows, raios, chamas)
     que o BiRefNet classificou como background.
@@ -223,48 +235,60 @@ def _chroma_augment_mask(
     opacidade frequentemente recebem alpha=0 do modelo, mesmo sendo parte
     visível do asset.
 
-    Estratégia:
-      1. Mede distância de cor (max diff por canal) entre cada pixel e o
-         fundo estimado.
-      2. Aplica soft threshold para detectar pixels visivelmente coloridos.
-      3. Pondera por proximidade ao foreground (distance transform) — evita
-         capturar ruído em regiões distantes do objeto.
-      4. Combina com a máscara original via max() — só aumenta, nunca reduz.
+    Sinal usado (combinação de três métricas robustas a glows azulados):
+      a) chroma_diff   — max channel diff vs bg_color (cor diferente do bg)
+      b) saturation    — (max - min)/max do RGB local (pixel "puxa" pra uma cor)
+      c) luminance_dev — quão diferente a luminância está do bg
+    Toma o **max** das três → captura tanto glow muito colorido quanto
+    glow esbranquiçado-mas-saturado quanto sombra/borda escura.
 
-    Limitação fundamental: glows brancos puros sobre fundo branco são
-    matematicamente indistinguíveis. Só recupera efeitos com cor.
+    Pondera por proximidade ao foreground (distance transform) e combina
+    com a máscara original via max() — só aumenta, nunca reduz.
 
-    Parâmetros:
-      color_threshold: distância mínima de cor (0-1) para considerar pixel
-                       como "colorido". Default 0.10 = 10% de diff.
-      max_boost: alpha máximo aplicado pela augmentation (cap). Default 0.85.
-      proximity_frac: sigma do falloff de proximidade como fração da
-                      diagonal da imagem. Default 0.06 = 6%.
+    Retorna (mask_aumentada, augmented_region_bool) onde augmented_region
+    marca pixels que foram recuperados pela augmentation (para que a
+    decontamination posterior possa pulá-los).
     """
     fg = mask > 0.5
     if not fg.any():
-        # Nada de foreground detectado — não há a que se ancorar
-        return mask
+        return mask, np.zeros_like(mask, dtype=bool)
 
-    # 1. Distância de cor por pixel (max channel diff, normalizado)
-    diff = np.abs(rgb_arr.astype(np.float32) - bg_color.reshape(1, 1, 3))
-    color_dist = diff.max(axis=2) / 255.0  # (H, W) [0, 1]
+    rgb_f = rgb_arr.astype(np.float32) / 255.0
+    bg_f = bg_color.astype(np.float32).reshape(1, 1, 3) / 255.0
 
-    # 2. Soft threshold: pixels acima do threshold ganham peso linearmente
-    chroma_mask = np.clip((color_dist - color_threshold) * 4.0, 0.0, 1.0)
+    # (a) Distância de cor — pixel difere do bg em algum canal
+    chroma_diff = np.abs(rgb_f - bg_f).max(axis=2)
 
-    # 3. Proximidade ao foreground via distance transform
+    # (b) Saturação local — pixel "puxa" pra uma cor (distingue cinza de azul claro)
+    rgb_max = rgb_f.max(axis=2)
+    rgb_min = rgb_f.min(axis=2)
+    saturation = (rgb_max - rgb_min) / np.maximum(rgb_max, 1e-6)
+
+    # (c) Desvio de luminância vs bg — captura raios/sombras acromáticos
+    lum = rgb_f.mean(axis=2)
+    bg_lum = float(bg_f.mean())
+    lum_dev = np.abs(lum - bg_lum)
+
+    # Sinal combinado — max das três métricas
+    signal = np.maximum.reduce([chroma_diff, saturation, lum_dev])
+
+    # Soft threshold: pixels acima do threshold ganham peso linearmente
+    chroma_mask = np.clip((signal - signal_threshold) * 3.0, 0.0, 1.0)
+
+    # Proximidade ao foreground via distance transform
     h, w = mask.shape
     diag = float(np.sqrt(h * h + w * w))
-    sigma = max(10.0, diag * proximity_frac)
+    sigma = max(20.0, diag * proximity_frac)
     distance = ndimage.distance_transform_edt(~fg).astype(np.float32)
     proximity = np.exp(-distance / sigma)
 
-    # 4. Augmentation final: chroma × proximidade × cap
+    # Augmentation final
     augmentation = chroma_mask * proximity * max_boost
 
-    # 5. Combina com a máscara: max() — preserva foreground original intacto
-    return np.maximum(mask, augmentation)
+    new_mask = np.maximum(mask, augmentation)
+    augmented_region = (new_mask - mask) > 0.05  # marca pixels efetivamente boostados
+
+    return new_mask, augmented_region
 
 
 def _guided_filter_mask(
@@ -369,6 +393,7 @@ def _estimate_bg_color(rgb_arr: np.ndarray, mask: np.ndarray) -> np.ndarray:
 def _decontaminate_colors(
     rgba: np.ndarray,
     bg_color: np.ndarray,
+    skip_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     Remove sangramento de cor do fundo em pixels semi-transparentes (halo).
@@ -390,6 +415,10 @@ def _decontaminate_colors(
 
     # Só processa pixels semi-transparentes (borda real do objeto)
     edge = (alpha > 0.02) & (alpha < 0.92)
+    if skip_mask is not None:
+        # Pixels recuperados pela chroma augmentation não são misturas
+        # físicas com o bg — pular para preservar suas cores reais.
+        edge = edge & ~skip_mask
     if not edge.any():
         return rgba
 
