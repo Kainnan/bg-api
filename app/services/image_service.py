@@ -222,9 +222,9 @@ def _chroma_augment_mask(
     mask: np.ndarray,
     bg_color: np.ndarray,
     *,
-    signal_threshold: float = 0.04,
-    max_boost: float = 0.95,
-    proximity_frac: float = 0.14,
+    signal_threshold: float = 0.06,
+    max_boost: float = 0.90,
+    proximity_frac: float = 0.10,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Recupera efeitos coloridos semi-transparentes (glows, raios, chamas)
@@ -235,12 +235,14 @@ def _chroma_augment_mask(
     opacidade frequentemente recebem alpha=0 do modelo, mesmo sendo parte
     visível do asset.
 
-    Sinal usado (combinação de três métricas robustas a glows azulados):
-      a) chroma_diff   — max channel diff vs bg_color (cor diferente do bg)
-      b) saturation    — (max - min)/max do RGB local (pixel "puxa" pra uma cor)
-      c) luminance_dev — quão diferente a luminância está do bg
-    Toma o **max** das três → captura tanto glow muito colorido quanto
-    glow esbranquiçado-mas-saturado quanto sombra/borda escura.
+    Sinal usado (combinação de métricas direcionais — só dispara pra glow real):
+      a) saturation    — (max - min)/max do RGB local (pixel é colorido)
+      b) color_cast    — desvio padrão dos canais (pixel "puxa" pra uma cor)
+      c) brighter      — max(0, lum - bg_lum) (pixel mais claro que o bg = glow)
+
+    Crucial: nunca usa "mais escuro que bg" — isso captaria contornos
+    anti-aliased / halos de compressão JPEG ao redor do objeto, gerando
+    falsos positivos visíveis como "recortes do branco".
 
     Pondera por proximidade ao foreground (distance transform) e combina
     com a máscara original via max() — só aumenta, nunca reduz.
@@ -256,21 +258,23 @@ def _chroma_augment_mask(
     rgb_f = rgb_arr.astype(np.float32) / 255.0
     bg_f = bg_color.astype(np.float32).reshape(1, 1, 3) / 255.0
 
-    # (a) Distância de cor — pixel difere do bg em algum canal
-    chroma_diff = np.abs(rgb_f - bg_f).max(axis=2)
-
-    # (b) Saturação local — pixel "puxa" pra uma cor (distingue cinza de azul claro)
+    # (a) Saturação — pixel "puxa" pra uma cor (não dispara em cinzas)
     rgb_max = rgb_f.max(axis=2)
     rgb_min = rgb_f.min(axis=2)
     saturation = (rgb_max - rgb_min) / np.maximum(rgb_max, 1e-6)
 
-    # (c) Desvio de luminância vs bg — captura raios/sombras acromáticos
+    # (b) Color cast — std dos canais, captura tons levemente coloridos
+    color_cast = rgb_f.std(axis=2) * 2.0  # *2 pra deixar na mesma escala
+
+    # (c) "Mais brilhante que o bg" — captura glows brancos/claros sobre fundo escuro.
+    # Usa max() por canal pra também capturar saturação direcional (ex.: azul puro
+    # mais saturado que o bg branco em um dos canais).
     lum = rgb_f.mean(axis=2)
     bg_lum = float(bg_f.mean())
-    lum_dev = np.abs(lum - bg_lum)
+    brighter = np.clip(lum - bg_lum, 0.0, 1.0)
 
-    # Sinal combinado — max das três métricas
-    signal = np.maximum.reduce([chroma_diff, saturation, lum_dev])
+    # Sinal combinado — max das três (todas direcionais, não disparam em halo escuro)
+    signal = np.maximum.reduce([saturation, color_cast, brighter])
 
     # Soft threshold: pixels acima do threshold ganham peso linearmente
     chroma_mask = np.clip((signal - signal_threshold) * 3.0, 0.0, 1.0)
