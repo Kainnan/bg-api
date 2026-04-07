@@ -910,11 +910,15 @@ def _connected_background_mask(
     w: int,
     cell_seeds_yx: list[tuple[int, int]],
     threshold: int,
+    bg_mode: str = "light",
 ) -> np.ndarray:
     """
     Detecta pixels de fundo usando componentes conectados no original.
 
-    1. Marca pixels "claros" no original (R,G,B >= threshold-10) como candidatos
+    bg_mode="light": pixels claros (R,G,B >= threshold-10) e acromáticos
+    bg_mode="dark":  pixels escuros (R,G,B <= dark_threshold) e acromáticos
+
+    1. Marca pixels candidatos a fundo
     2. Faz labeling de componentes conectados (4-conectividade)
     3. Seleciona componentes que tocam a borda da imagem (fundo externo)
        OU contêm os centros das células (fundo interno das células)
@@ -923,16 +927,22 @@ def _connected_background_mask(
     Vantagem sobre inset: para naturalmente nos divisores coloridos do frame,
     sem precisar definir zonas de exclusão manualmente.
     """
-    thr = threshold - 10
     rgb = original_arr[:, :, :3].astype(np.int16)
     r_ch, g_ch, b_ch = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
     mx = np.maximum(np.maximum(r_ch, g_ch), b_ch)
     mn = np.minimum(np.minimum(r_ch, g_ch), b_ch)
-    # Pixel é "fundo branco" somente se for claro E de baixa saturação (≈acromático).
-    # Glows coloridos (verde, azul) têm diff alto → NÃO são fundo → preservados como arte do frame.
-    is_light = (r_ch >= thr) & (g_ch >= thr) & (b_ch >= thr) & ((mx - mn) <= 15)
 
-    labeled, _ = ndimage.label(is_light)
+    if bg_mode == "dark":
+        # Fundo preto: pixels muito escuros e acromáticos.
+        # Glows coloridos (verde, azul, laranja) têm canais altos → NÃO são fundo.
+        dark_thr = int(os.getenv("FRAME_DARK_BG_THRESHOLD", "20"))
+        is_bg = (r_ch <= dark_thr) & (g_ch <= dark_thr) & (b_ch <= dark_thr) & ((mx - mn) <= 15)
+    else:
+        # Fundo branco: pixels claros e pouco saturados (acromáticos).
+        thr = threshold - 10
+        is_bg = (r_ch >= thr) & (g_ch >= thr) & (b_ch >= thr) & ((mx - mn) <= 15)
+
+    labeled, _ = ndimage.label(is_bg)
 
     bg_labels: set[int] = set()
 
@@ -986,23 +996,33 @@ def _remove_frame_by_components(
     """
     Remove o fundo de um frame usando APENAS componentes conectados — sem rembg.
 
-    Vantagens sobre rembg para frames com fundo branco:
+    Detecta automaticamente se o fundo é claro ou escuro pelos cantos da
+    imagem e aplica a busca de componentes apropriada.
+
+    Vantagens sobre BiRefNet para frames:
     - Borda externa preservada 100% (nunca tocamos pixels do frame art)
     - Resultado determinístico, sem variação entre runs
     - Muito mais rápido (sem inferência de modelo)
     - Funciona para qualquer estilo de frame, qualquer cor de divisor
 
     Algoritmo:
-    1. Marca pixels claros no original (R,G,B >= thr)
-    2. Labels de componentes conectados (4-conectividade)
-    3. Fundo externo  = componentes tocando bordas da imagem
+    1. Detecta bg_mode (light/dark) pelos cantos
+    2. Marca pixels do fundo (claros OU escuros conforme bg_mode)
+    3. Labels de componentes conectados (4-conectividade)
+    4. Fundo externo  = componentes tocando bordas da imagem
        Fundo interno  = componentes tocando centros das células
-    4. Ambos recebem alpha=0; tudo mais recebe alpha=255 (arte do frame intacta)
-    5. Aplica Gaussian feather de 1px na fronteira para suavizar a borda externa
+    5. Ambos recebem alpha=0; tudo mais recebe alpha=255 (arte do frame intacta)
+    6. Aplica Gaussian feather de 1px na fronteira para suavizar a borda externa
     """
     h, w = original_arr.shape[:2]
+    bg_mode = _detect_bg_mode(original_arr[:, :, :3])
+    # Frames são "light" ou "dark" — "mixed" cai pra light por compatibilidade
+    if bg_mode != "dark":
+        bg_mode = "light"
+    logger.info("_remove_frame_by_components: bg_mode=%s kind=%s", bg_mode, kind.value)
+
     seeds = _cell_center_seeds(h, w, kind)
-    bg_mask = _connected_background_mask(original_arr, h, w, seeds, threshold)
+    bg_mask = _connected_background_mask(original_arr, h, w, seeds, threshold, bg_mode=bg_mode)
     logger.debug("_remove_frame_by_components: bg_mask=%.1f%% do total", 100 * bg_mask.mean())
 
     result = original_arr.copy()
