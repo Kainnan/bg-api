@@ -119,6 +119,30 @@ _BRIA_TRANSFORM = transforms.Compose([
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
 ])
 
+def _git_version() -> str:
+    """Retorna o commit hash atual + flag de dirty, pra logar qual versão tá rodando."""
+    try:
+        import subprocess
+        repo_root = Path(__file__).resolve().parents[2]
+        sha = subprocess.check_output(
+            ["git", "-C", str(repo_root), "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        dirty = subprocess.call(
+            ["git", "-C", str(repo_root), "diff", "--quiet"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ) != 0
+        return f"{sha}{'-dirty' if dirty else ''}"
+    except Exception:
+        return "unknown"
+
+
+_BG_API_VERSION = _git_version()
+logger.info("=" * 60)
+logger.info("  bg-api iniciando | versão git: %s", _BG_API_VERSION)
+logger.info("=" * 60)
+
+
 try:
     from transformers import AutoModelForImageSegmentation
 

@@ -87,8 +87,12 @@ async def _log_requests(request: Request, call_next):
 
 @app.get("/health", tags=["sistema"])
 def health():
-    from app.services.image_service import _BRIA_MODEL
-    return {"status": "ok", "birefnet": _BRIA_MODEL is not None}
+    from app.services.image_service import _BRIA_MODEL, _BG_API_VERSION
+    return {
+        "status": "ok",
+        "birefnet": _BRIA_MODEL is not None,
+        "version": _BG_API_VERSION,
+    }
 
 
 if __name__ == "__main__":
