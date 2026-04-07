@@ -87,8 +87,8 @@ async def _log_requests(request: Request, call_next):
 
 @app.get("/health", tags=["sistema"])
 def health():
-    from app.services.image_service import _REMBG_AVAILABLE
-    return {"status": "ok", "rembg": _REMBG_AVAILABLE}
+    from app.services.image_service import _BRIA_MODEL
+    return {"status": "ok", "birefnet": _BRIA_MODEL is not None}
 
 
 if __name__ == "__main__":

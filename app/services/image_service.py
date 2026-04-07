@@ -138,18 +138,197 @@ except Exception as _e:
 
 
 def _bria_remove(image: Image.Image) -> Image.Image:
-    """Remove o fundo usando BiRefNet. Retorna RGBA."""
+    """
+    Remove o fundo usando BiRefNet + pós-processamento de qualidade.
+
+    Pipeline:
+      1. BiRefNet → máscara crua (1024×1024 upscaled)
+      2. Guided filter → refina bordas usando imagem original como guia
+      3. Feathering adaptativo → transições nítidas ou suaves conforme gradiente
+      4. Color decontamination → remove sangramento de cor do fundo nas bordas
+    Retorna RGBA.
+    """
     rgb = image.convert("RGB")
-    original_size = rgb.size
+    original_size = rgb.size  # (W, H)
+
+    # ── 1. Inferência BiRefNet → máscara crua ─────────────────────────────
+    t0 = time.perf_counter()
     tensor = _BRIA_TRANSFORM(rgb).unsqueeze(0).to(_BRIA_DEVICE)
-    # Cast para o dtype do modelo (pode ser float16 quando carregado em GPU)
     tensor = tensor.to(next(_BRIA_MODEL.parameters()).dtype)
     with torch.no_grad():
         preds = _BRIA_MODEL(tensor)[-1].sigmoid().cpu()
-    mask = transforms.ToPILImage()(preds[0].squeeze())
-    mask = mask.resize(original_size, Image.LANCZOS)
-    rgb.putalpha(mask)
-    return rgb
+    raw_mask_pil = transforms.ToPILImage()(preds[0].squeeze())
+    raw_mask_pil = raw_mask_pil.resize(original_size, Image.LANCZOS)
+    logger.debug("_bria_remove: inferência em %.2fs", time.perf_counter() - t0)
+
+    # Arrays float32 para pós-processamento
+    rgb_arr = np.array(rgb)                                    # (H, W, 3) uint8
+    rgb_f = rgb_arr.astype(np.float32) / 255.0                 # (H, W, 3) [0,1]
+    mask_f = np.array(raw_mask_pil).astype(np.float32) / 255.0  # (H, W)   [0,1]
+
+    # ── 2. Guided filter — refina bordas com resolução original como guia ─
+    t1 = time.perf_counter()
+    mask_f = _guided_filter_mask(rgb_f, mask_f, radius=8, eps=1e-4)
+    logger.debug("_bria_remove: guided filter em %.2fs", time.perf_counter() - t1)
+
+    # ── 3. Feathering adaptativo — bordas nítidas vs suaves ───────────────
+    t2 = time.perf_counter()
+    mask_f = _adaptive_feather(rgb_f, mask_f)
+    logger.debug("_bria_remove: adaptive feather em %.2fs", time.perf_counter() - t2)
+
+    # ── 4. Montar RGBA ────────────────────────────────────────────────────
+    alpha = (np.clip(mask_f, 0, 1) * 255).astype(np.uint8)
+    rgba = np.dstack([rgb_arr, alpha])
+
+    # ── 5. Color decontamination — remove halo de cor do fundo ────────────
+    t3 = time.perf_counter()
+    bg_color = _estimate_bg_color(rgb_arr.astype(np.float32), mask_f)
+    rgba = _decontaminate_colors(rgba, bg_color)
+    logger.debug("_bria_remove: decontamination em %.2fs (bg_color=%s)", time.perf_counter() - t3, bg_color.astype(int))
+
+    logger.debug("_bria_remove: pipeline completo em %.2fs", time.perf_counter() - t0)
+    return Image.fromarray(rgba, "RGBA")
+
+
+# ---------------------------------------------------------------------------
+# Pós-processamento de máscara e cores — qualidade profissional
+# ---------------------------------------------------------------------------
+
+def _guided_filter_mask(
+    guide_rgb: np.ndarray,
+    mask: np.ndarray,
+    radius: int = 8,
+    eps: float = 1e-4,
+) -> np.ndarray:
+    """
+    Refina a máscara usando guided filter com a imagem original como guia.
+
+    A máscara do BiRefNet (1024×1024 upscaled) tem bordas borradas/dentadas.
+    O guided filter usa os gradientes da imagem em resolução completa para
+    alinhar a máscara às bordas reais do objeto — preservando detalhes finos
+    (pontas de espada, joias, letras) que se perdem no upscale.
+
+    Complexidade: O(N) independente do raio (uniform_filter é separável).
+
+    guide_rgb: (H, W, 3) float32 [0,1]
+    mask:      (H, W)    float32 [0,1]
+    """
+    from scipy.ndimage import uniform_filter
+
+    guide_gray = np.mean(guide_rgb, axis=2)
+    k = 2 * radius + 1
+
+    mean_I = uniform_filter(guide_gray, size=k)
+    mean_p = uniform_filter(mask, size=k)
+    mean_Ip = uniform_filter(guide_gray * mask, size=k)
+    mean_II = uniform_filter(guide_gray * guide_gray, size=k)
+
+    cov_Ip = mean_Ip - mean_I * mean_p
+    var_I = mean_II - mean_I * mean_I
+
+    a = cov_Ip / (var_I + eps)
+    b = mean_p - a * mean_I
+
+    mean_a = uniform_filter(a, size=k)
+    mean_b = uniform_filter(b, size=k)
+
+    return np.clip(mean_a * guide_gray + mean_b, 0.0, 1.0)
+
+
+def _adaptive_feather(
+    guide_rgb: np.ndarray,
+    mask: np.ndarray,
+    sigma_sharp: float = 0.5,
+    sigma_soft: float = 2.5,
+    boundary_px: int = 4,
+) -> np.ndarray:
+    """
+    Feathering adaptativo baseado no gradiente local da imagem.
+
+    - Bordas com alto contraste (metal, contornos nítidos) → transição fina (sigma_sharp)
+    - Bordas com gradiente suave (glow, fumaça, reflexos) → transição ampla (sigma_soft)
+    - Só modifica pixels na vizinhança da fronteira da máscara (boundary_px).
+
+    guide_rgb: (H, W, 3) float32 [0,1]
+    mask:      (H, W)    float32 [0,1]
+    """
+    gray = np.mean(guide_rgb, axis=2)
+    gy, gx = np.gradient(gray)
+    grad_mag = np.sqrt(gx ** 2 + gy ** 2)
+
+    p99 = np.percentile(grad_mag, 99) + 1e-8
+    grad_norm = np.clip(grad_mag / p99, 0.0, 1.0)
+
+    # Fronteira da máscara (dilatação − erosão)
+    fg = mask > 0.5
+    dilated = ndimage.binary_dilation(fg, iterations=boundary_px)
+    eroded = ndimage.binary_erosion(fg, iterations=boundary_px)
+    boundary = dilated & ~eroded
+
+    if not boundary.any():
+        return mask
+
+    blur_sharp = ndimage.gaussian_filter(mask, sigma=sigma_sharp)
+    blur_soft = ndimage.gaussian_filter(mask, sigma=sigma_soft)
+
+    # Alto gradiente → sharp, baixo gradiente → soft
+    blended = blur_sharp * grad_norm + blur_soft * (1.0 - grad_norm)
+
+    result = mask.copy()
+    result[boundary] = blended[boundary]
+    return result
+
+
+def _estimate_bg_color(rgb_arr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """
+    Estima a cor dominante do fundo a partir dos pixels com baixo valor de máscara.
+
+    rgb_arr: (H, W, 3) float32 [0, 255]
+    mask:    (H, W)    float32 [0, 1]
+    Retorna: (3,) float32 [0, 255]
+    """
+    bg_pixels = mask < 0.1
+    if bg_pixels.sum() < 100:
+        return np.array([255.0, 255.0, 255.0])
+    return np.median(rgb_arr[bg_pixels], axis=0)
+
+
+def _decontaminate_colors(
+    rgba: np.ndarray,
+    bg_color: np.ndarray,
+) -> np.ndarray:
+    """
+    Remove sangramento de cor do fundo em pixels semi-transparentes (halo).
+
+    Quando um asset está sobre fundo claro, os pixels da borda são uma mistura:
+        C_observada = C_real × α + C_fundo × (1 − α)
+
+    Invertendo para recuperar a cor original do foreground:
+        C_real = (C_observada − C_fundo × (1 − α)) / α
+
+    Isso elimina o halo branco/claro que aparece quando o asset processado
+    é colocado sobre um background escuro (ex.: tema de jogo noturno).
+
+    rgba:     (H, W, 4) uint8
+    bg_color: (3,) float32 [0, 255]
+    """
+    result = rgba.astype(np.float32)
+    alpha = result[:, :, 3] / 255.0
+
+    # Só processa pixels semi-transparentes (borda real do objeto)
+    edge = (alpha > 0.02) & (alpha < 0.92)
+    if not edge.any():
+        return rgba
+
+    a = alpha[edge, np.newaxis]                     # (N, 1)
+    rgb = result[edge, :3]                           # (N, 3)
+    bg = bg_color.astype(np.float32).reshape(1, 3)   # (1, 3)
+
+    a_safe = np.maximum(a, 0.05)
+    decontaminated = (rgb - bg * (1.0 - a)) / a_safe
+    result[edge, :3] = np.clip(decontaminated, 0.0, 255.0)
+
+    return np.clip(result, 0.0, 255.0).astype(np.uint8)
 
 
 # ---------------------------------------------------------------------------
