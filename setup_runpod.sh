@@ -22,7 +22,9 @@ source .venv/bin/activate
 
 echo "==> [3/4] pip + requirements.txt"
 python -m pip install --upgrade pip wheel
-pip install -r requirements.txt
+# Instala com índice extra do PyTorch CUDA 12.4 (compatível com drivers 12.x).
+# Sem isso, pip pega torch >= 2.10 que exige CUDA 13 e falha em GPUs mais antigas.
+pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu124
 # Obrigatório para FastAPI com UploadFile/Form (evita erro se algo falhar no freeze)
 pip install "python-multipart>=0.0.9"
 

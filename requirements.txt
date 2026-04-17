@@ -4,7 +4,12 @@ pillow
 python-multipart>=0.0.9
 scipy
 numpy
-torch
-torchvision
+# torch 2.6.0+cu124 é a última versão compatível com driver NVIDIA CUDA 12.4.
+# Instale a partir do índice extra: pip install torch==2.6.0+cu124 torchvision==0.21.0+cu124 --extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0
+torchvision==0.21.0
 transformers
 kornia
+# Dependências obrigatórias do BiRefNet (senão cai no fallback por threshold).
+einops
+timm
