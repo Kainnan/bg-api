@@ -241,9 +241,18 @@ def _process_dark_bg(
         α_natural = max(R, G, B) / 255           (alpha exato por pixel)
         C_real    = C_obs / α_natural             (decontamination exata)
 
-    O alpha final combina o BiRefNet (objeto sólido) com o alpha natural
-    (glows e VFX), restrito a uma região de interesse expandida do BiRefNet
-    pra não capturar ruído distante do objeto.
+    O desafio: pixels pretos puros são AMBÍGUOS — podem ser fundo (transparente)
+    ou contorno do objeto (opaco). BiRefNet ajuda a decidir, mas pode errar e
+    incluir grandes áreas de fundo preto como foreground (ex.: áreas vazias
+    entre partículas de VFX coloridos).
+
+    Estratégia:
+      1. α_natural = max(RGB) — alpha matematicamente exato
+      2. ROI (suave) ao redor do foreground do BiRefNet — suprime ruído distante
+      3. edge_gate: pixels pretos só "herdam" alpha do BiRefNet se estiverem
+         próximos de pixels brilhantes (= provável contorno/outline).
+         Pretos longe de qualquer brilho = fundo capturado errado pelo BiRefNet
+         → permanece transparente.
     """
     t0 = time.perf_counter()
 
@@ -252,18 +261,36 @@ def _process_dark_bg(
 
     # 2. Região de interesse: expandir o BiRefNet pra alcançar glows próximos
     fg_seed = birefnet_mask > 0.5
+    h, w = birefnet_mask.shape
+    diag = float(np.sqrt(h * h + w * w))
     if fg_seed.any():
-        h, w = birefnet_mask.shape
-        diag = float(np.sqrt(h * h + w * w))
         sigma = max(20.0, diag * 0.12)
         distance = ndimage.distance_transform_edt(~fg_seed).astype(np.float32)
         roi = np.exp(-distance / sigma)  # falloff suave do objeto pra fora
     else:
         roi = np.ones_like(birefnet_mask)
 
-    # 3. Combina: dentro do BiRefNet usa max(birefnet, natural).
-    #    Fora, usa só alpha_natural × roi (decai com distância).
-    combined = np.maximum(birefnet_mask, alpha_natural * roi)
+    # 3. Edge gate: só permite BiRefNet "pintar" pixels pretos PRÓXIMOS de
+    #    pixels brilhantes (= outline/contorno válido). Pretos isolados
+    #    ficam transparentes mesmo se BiRefNet disser que são foreground.
+    bright = alpha_natural > 0.08
+    if bright.any():
+        # Allowance ~0.5% da diagonal (ex.: 7px em 1448diag) — suficiente pra
+        # capturar contornos de 2-3px sem deixar grandes áreas pretas.
+        edge_px = max(3.0, diag * 0.005)
+        bright_distance = ndimage.distance_transform_edt(~bright).astype(np.float32)
+        edge_gate = np.exp(-bright_distance / edge_px)
+    else:
+        edge_gate = np.zeros_like(alpha_natural)
+
+    # 4. Combina:
+    #    - Pixels brilhantes: alpha_natural × roi (pura matemática)
+    #    - Pretos próximos de brilho: birefnet_mask × edge_gate × roi (outline)
+    #    - Pretos isolados (mesmo se BiRefNet disser FG): 0 (fundo errado)
+    combined = np.maximum(
+        alpha_natural * roi,
+        birefnet_mask * edge_gate * roi,
+    )
 
     # 4. Refino de borda com guided filter (mais suave que no light mode)
     t1 = time.perf_counter()
