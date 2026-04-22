@@ -8,8 +8,11 @@ from pathlib import Path
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
+from PIL import Image
 
 from app.services.image_service import (
+    _BRIA_MODEL,
+    _bria_remove,
     compress_to_webp_only,
     is_background_asset,
     remove_light_background,
@@ -116,4 +119,78 @@ async def process_zip(
         headers={
             "Content-Disposition": 'attachment; filename="images.zip"',
         },
+    )
+
+
+@router.post(
+    "/process-frame",
+    summary="Remover fundo de UMA frame de vídeo (RGB → RGBA PNG)",
+    response_description="PNG RGBA lossless, mesma dimensão da entrada",
+)
+async def process_frame(file: UploadFile = File(...)):
+    """
+    Endpoint dedicado a frames vindos de pipelines de video diffusion (motion-api,
+    Runway, etc).
+
+    Diferenças vs `/process-image`:
+      • IGNORA heurísticas de filename (`is_frame_asset`, `is_background_asset`).
+        Necessário porque frames de vídeo costumam ter nomes tipo `frame_00001.png`
+        que ativariam o pipeline de slot-frame (componentes conectados) por engano.
+      • SEMPRE usa BiRefNet — sem fallback de threshold (qualidade consistente).
+      • Retorna PNG lossless (compress_level=1, rápido) em vez de WebP lossy,
+        porque os frames serão re-encodados em vídeo (WebM/MP4) logo depois e
+        cada camada de compressão lossy degrada o resultado final.
+      • Sem parâmetros — input simples, contrato direto.
+
+    Espera-se que o input seja RGB (ou RGBA com fundo opaco) — diffusion models
+    flatten alpha em fundo neutro antes de gerar.
+    """
+    if _BRIA_MODEL is None:
+        raise HTTPException(
+            status_code=503,
+            detail="BiRefNet não está carregado — necessário para /process-frame",
+        )
+
+    raw = await file.read()
+    await file.close()
+    if not raw:
+        raise HTTPException(status_code=400, detail="arquivo vazio")
+
+    t0 = time.perf_counter()
+    try:
+        image = Image.open(io.BytesIO(raw))
+        image.load()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"imagem inválida: {exc}")
+
+    logger.info(
+        "process-frame | %s %dx%d modo=%s",
+        file.filename or "frame.png", image.width, image.height, image.mode,
+    )
+
+    try:
+        rgba = _bria_remove(image)
+    except Exception as exc:
+        logger.exception("process-frame | BiRefNet falhou")
+        raise HTTPException(status_code=500, detail=f"falha na segmentação: {exc}")
+
+    if rgba.mode != "RGBA":
+        rgba = rgba.convert("RGBA")
+
+    out_buf = io.BytesIO()
+    # compress_level=1: ~2-3x mais rápido que default (6), só ~10-15% maior em bytes.
+    # Lossless de qualquer forma — a próxima etapa (WebM encode) recomprime.
+    rgba.save(out_buf, format="PNG", optimize=False, compress_level=1)
+    out_buf.seek(0)
+
+    elapsed = time.perf_counter() - t0
+    logger.info(
+        "process-frame | concluído em %.2fs | entrada=%.1fKB saída=%.1fKB",
+        elapsed, len(raw) / 1024, out_buf.getbuffer().nbytes / 1024,
+    )
+
+    return StreamingResponse(
+        out_buf,
+        media_type="image/png",
+        headers={"Content-Disposition": 'attachment; filename="frame.png"'},
     )
